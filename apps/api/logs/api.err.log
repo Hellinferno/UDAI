@@ -1,0 +1,14 @@
+INFO:     Will watch for changes in these directories: ['C:\\Users\\Lenovo\\Downloads\\AI Investment Banking Analyst Agent (AIBAA)\\aibaa\\apps\\api']
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+INFO:     Started reloader process [23052] using WatchFiles
+C:\Users\Lenovo\AppData\Local\Programs\Python\Python311\Lib\site-packages\pydantic\_internal\_fields.py:184: UserWarning: Field name "name" shadows an attribute in parent "Operation"; 
+  warnings.warn(
+C:\Users\Lenovo\AppData\Local\Programs\Python\Python311\Lib\site-packages\pydantic\_internal\_fields.py:184: UserWarning: Field name "metadata" shadows an attribute in parent "Operation"; 
+  warnings.warn(
+C:\Users\Lenovo\AppData\Local\Programs\Python\Python311\Lib\site-packages\pydantic\_internal\_fields.py:184: UserWarning: Field name "done" shadows an attribute in parent "Operation"; 
+  warnings.warn(
+C:\Users\Lenovo\AppData\Local\Programs\Python\Python311\Lib\site-packages\pydantic\_internal\_fields.py:184: UserWarning: Field name "error" shadows an attribute in parent "Operation"; 
+  warnings.warn(
+INFO:     Started server process [4272]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
