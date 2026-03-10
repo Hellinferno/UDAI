@@ -1,4 +1,4 @@
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 class DCFEngine:
     """
@@ -77,6 +77,38 @@ class DCFEngine:
             "debt_to_equity": debt_to_equity,
             "weight_of_equity": round(weight_of_equity, 4),
             "weight_of_debt": round(weight_of_debt, 4)
+        }
+
+    def calculate_private_company_wacc_breakdown(
+        self,
+        risk_free_rate: float = 0.07,
+        equity_risk_premium: float = 0.065,
+        size_premium: float = 0.03,
+        specific_risk_premium: float = 0.04,
+        cost_of_debt: float = 0.09,
+        debt_to_equity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Build-up method for private-company cost of equity."""
+        cost_of_equity = risk_free_rate + equity_risk_premium + size_premium + specific_risk_premium
+        after_tax_cost_of_debt = cost_of_debt * (1 - self.tax_rate)
+
+        weight_of_debt = debt_to_equity / (1 + debt_to_equity)
+        weight_of_equity = 1 - weight_of_debt
+        wacc = (weight_of_equity * cost_of_equity) + (weight_of_debt * after_tax_cost_of_debt)
+
+        return {
+            "wacc": round(wacc, 4),
+            "method": "build_up",
+            "risk_free_rate": risk_free_rate,
+            "equity_risk_premium": equity_risk_premium,
+            "size_premium": size_premium,
+            "specific_risk_premium": specific_risk_premium,
+            "cost_of_equity": round(cost_of_equity, 4),
+            "cost_of_debt": cost_of_debt,
+            "after_tax_cost_of_debt": round(after_tax_cost_of_debt, 4),
+            "debt_to_equity": debt_to_equity,
+            "weight_of_equity": round(weight_of_equity, 4),
+            "weight_of_debt": round(weight_of_debt, 4),
         }
 
     def build_projections(self, projection_years: int = 7, terminal_growth_rate: float = 0.025,
@@ -246,8 +278,8 @@ class DCFEngine:
             }
         }
 
-    def calculate_valuation(self, ufcf_projections: List[float], wacc: float, terminal_growth_rate: float, 
-                           net_debt: float = 0, shares_outstanding: float = 1) -> Dict[str, Any]:
+    def calculate_valuation(self, ufcf_projections: List[float], wacc: float, terminal_growth_rate: float,
+                           net_debt: float = 0, shares_outstanding: Optional[float] = 1) -> Dict[str, Any]:
         """Calculates Terminal Value and Enterprise Value (EV)."""
         if not ufcf_projections:
             raise ValueError("UFCF projections are empty.")
@@ -278,13 +310,15 @@ class DCFEngine:
 
         # Implied Equity Value & Share Price
         equity_value = implied_ev - net_debt
-        share_price = equity_value / shares_outstanding if shares_outstanding > 0 else 0
+        share_price = None
+        if shares_outstanding is not None and shares_outstanding > 0:
+            share_price = equity_value / shares_outstanding
 
         # Sanity checks
         warnings = []
         if equity_value < 0:
             warnings.append("NEGATIVE EQUITY VALUE: Check net_debt and EBITDA margin inputs.")
-        if share_price < 0:
+        if share_price is not None and share_price < 0:
             warnings.append("NEGATIVE SHARE PRICE: Model output is mathematically impossible for a going concern.")
         if pv_of_fcf < 0:
             warnings.append("NEGATIVE PV OF FCF: EBITDA margins may be too low relative to D&A and CapEx.")
@@ -301,7 +335,7 @@ class DCFEngine:
             "net_debt": net_debt,
             "implied_equity_value": round(equity_value, 2),
             "shares_outstanding": shares_outstanding,
-            "implied_share_price": round(share_price, 2),
+            "implied_share_price": round(share_price, 2) if share_price is not None else None,
             "warnings": warnings
         }
 
@@ -310,7 +344,7 @@ class DCFEngine:
     # ------------------------------------------------------------------
 
     def run_scenario_analysis(self, ufcf: List[float], wacc: float, tgr: float,
-                              net_debt: float, shares: float) -> Dict[str, Any]:
+                              net_debt: float, shares: Optional[float]) -> Dict[str, Any]:
         """Bear / Base / Bull scenarios with WACC shifts."""
         scenarios = {}
         configs = [
@@ -367,7 +401,7 @@ class DCFEngine:
 
     def calculate_margin_sensitivity(self, revs: List[float],
                                      wacc: float, tgr: float,
-                                     net_debt: float, shares: float,
+                                     net_debt: float, shares: Optional[float],
                                      base_margin: float) -> Dict[str, Any]:
         """Run scenarios using absolute EBITDA margin impacts."""
         results = []
@@ -408,7 +442,9 @@ class DCFEngine:
         return {"cases": results}
 
     def build_sensitivity_matrix(self, ufcf: List[float], wacc: float, tgr: float,
-                                  net_debt: float, shares: float) -> Dict[str, Any]:
+                                  net_debt: float, shares: Optional[float],
+                                  metric: str = "share_price",
+                                  adjustment_factor: float = 1.0) -> Dict[str, Any]:
         """WACC x Terminal Growth Rate two-way sensitivity table."""
         wacc_steps = [wacc - 0.02, wacc - 0.01, wacc, wacc + 0.01, wacc + 0.02]
         tgr_steps = [tgr - 0.01, tgr - 0.005, tgr, tgr + 0.005, tgr + 0.01]
@@ -418,17 +454,19 @@ class DCFEngine:
             row = []
             for t in tgr_steps:
                 val = self.calculate_valuation(ufcf, w, t, net_debt, shares)
-                row.append(val["implied_share_price"])
+                value = val["implied_share_price"] if metric == "share_price" else val["implied_equity_value"]
+                row.append(round(value * adjustment_factor, 2) if value is not None else None)
             matrix.append(row)
 
         return {
             "wacc_headers": [round(w, 4) for w in wacc_steps],
             "tgr_headers": [round(t, 4) for t in tgr_steps],
             "matrix": matrix,
+            "metric": metric,
         }
 
     def calculate_capex_sensitivity(self, ufcf_base: List[float], revs: List[float],
-                                     wacc: float, tgr: float, net_debt: float, shares: float,
+                                     wacc: float, tgr: float, net_debt: float, shares: Optional[float],
                                      base_capex_pct: float) -> Dict[str, Any]:
         """Test sensitivity of valuation to CapEx intensity."""
         base_val = self.calculate_valuation(ufcf_base, wacc, tgr, net_debt, shares)
@@ -458,12 +496,14 @@ class DCFEngine:
                 "equity_value": val["implied_equity_value"],
                 "implied_price": val["implied_share_price"],
                 "price_delta_vs_base": round(val["implied_share_price"] - base_price, 2)
+                if base_price is not None and val["implied_share_price"] is not None
+                else None
             })
 
         return {"cases": results}
 
-    def build_full_scenario_analysis(self, wacc: float, tgr: float, net_debt: float, 
-                                     shares: float, projection_years: int = 7) -> Dict[str, Any]:
+    def build_full_scenario_analysis(self, wacc: float, tgr: float, net_debt: float,
+                                     shares: Optional[float], projection_years: int = 7) -> Dict[str, Any]:
         """
         Build comprehensive 3-scenario analysis (Bear/Base/Bull) with full projections.
         Returns all scenario data for display.

@@ -34,6 +34,10 @@ class WorkbookBuilder:
                         currency: str = "INR", historical: Dict[str, Any] = None) -> str:
         """Generates a multi-tab DCF Workbook and saves it to disk."""
         wb = openpyxl.Workbook()
+        is_private_company = bool(valuation.get("is_private_company"))
+        valuation_basis = valuation.get("valuation_basis", "share_price")
+        liquidity_discount = float(valuation.get("liquidity_discount", 0) or 0)
+        control_premium = float(valuation.get("control_premium", 0) or 0)
         
         # Dynamic currency format
         currency_symbol = "₹" if currency == "INR" else "$"
@@ -79,16 +83,29 @@ class WorkbookBuilder:
                 r += 1
                 ws_assumptions.cell(row=r, column=1, value=wacc_bk["note"]).font = Font(name='Arial', color='808080')
             else:
-                wacc_fields = [
-                    ("Risk-Free Rate (10Y G-Sec)", "risk_free_rate", True),
-                    ("Equity Risk Premium", "equity_risk_premium", True),
-                    ("Beta", "beta", False),
-                    ("Cost of Equity (CAPM)", "cost_of_equity", True),
-                    ("Cost of Debt", "cost_of_debt", True),
-                    ("After-Tax Cost of Debt", "after_tax_cost_of_debt", True),
-                    ("Weight of Equity", "weight_of_equity", True),
-                    ("Weight of Debt", "weight_of_debt", True)
-                ]
+                if wacc_bk.get("method") == "build_up":
+                    wacc_fields = [
+                        ("Risk-Free Rate", "risk_free_rate", True),
+                        ("Equity Risk Premium", "equity_risk_premium", True),
+                        ("Size Premium", "size_premium", True),
+                        ("Specific Risk Premium", "specific_risk_premium", True),
+                        ("Cost of Equity (Build-Up)", "cost_of_equity", True),
+                        ("Cost of Debt", "cost_of_debt", True),
+                        ("After-Tax Cost of Debt", "after_tax_cost_of_debt", True),
+                        ("Weight of Equity", "weight_of_equity", True),
+                        ("Weight of Debt", "weight_of_debt", True)
+                    ]
+                else:
+                    wacc_fields = [
+                        ("Risk-Free Rate (10Y G-Sec)", "risk_free_rate", True),
+                        ("Equity Risk Premium", "equity_risk_premium", True),
+                        ("Beta", "beta", False),
+                        ("Cost of Equity (CAPM)", "cost_of_equity", True),
+                        ("Cost of Debt", "cost_of_debt", True),
+                        ("After-Tax Cost of Debt", "after_tax_cost_of_debt", True),
+                        ("Weight of Equity", "weight_of_equity", True),
+                        ("Weight of Debt", "weight_of_debt", True)
+                    ]
                 for label, dict_key, is_pct in wacc_fields:
                     if dict_key in wacc_bk:
                         r += 1
@@ -225,10 +242,20 @@ class WorkbookBuilder:
             ("Less: Total Borrowings", total_borrowings),
             ("Add: Cash & Equivalents", cash_and_equiv),
             (f"Net Debt" if net_debt_val >= 0 else "Net Cash", abs(net_debt_val)),
-            ("Implied Equity Value", valuation.get("implied_equity_value", 0)),
-            ("Shares Outstanding", valuation.get("shares_outstanding", 1)),
-            ("Implied Share Price", valuation.get("implied_share_price", 0))
         ]
+        if is_private_company or valuation_basis == "equity_value":
+            equity_bridge.extend([
+                ("Pre-Adjustment Equity Value", valuation.get("pre_private_adjustment_equity_value", valuation.get("implied_equity_value", 0))),
+                ("Liquidity Discount %", liquidity_discount),
+                ("Control Premium %", control_premium),
+                ("Implied Equity Value", valuation.get("implied_equity_value", 0)),
+            ])
+        else:
+            equity_bridge.extend([
+                ("Implied Equity Value", valuation.get("implied_equity_value", 0)),
+                ("Shares Outstanding", valuation.get("shares_outstanding", 1)),
+                ("Implied Share Price", valuation.get("implied_share_price", 0)),
+            ])
         
         for name, val in equity_bridge:
             c_name = ws_val.cell(row=current_row, column=1, value=name)
@@ -237,7 +264,12 @@ class WorkbookBuilder:
                 c_name.border = self.border_bottom
             c_val = ws_val.cell(row=current_row, column=2, value=val)
             c_val.font = self.calc_font
-            c_val.number_format = curr_fmt if "Price" in name or "Value" in name or "Sum" in name or "Borrowings" in name or "Cash" in name or "Net" in name or "Terminal" in name else '#,##0'
+            if "Discount %" in name or "Premium %" in name:
+                c_val.number_format = '0.00%'
+            elif "Shares" in name:
+                c_val.number_format = '#,##0'
+            else:
+                c_val.number_format = curr_fmt if "Price" in name or "Value" in name or "Sum" in name or "Borrowings" in name or "Cash" in name or "Net" in name or "Terminal" in name else '#,##0'
             if "Enterprise" in name or "Equity Value" in name or "Share Price" in name:
                 c_val.border = self.border_bottom
             current_row += 1
@@ -248,14 +280,15 @@ class WorkbookBuilder:
 
         # --- Tab 4: Sensitivity Analysis ---
         ws_sens = wb.create_sheet(title="Sensitivity Analysis")
-        ws_sens["A1"] = f"{deal_name} - Implied Share Price Sensitivity ({currency})"
+        metric_title = "Implied Equity Value" if is_private_company or valuation_basis == "equity_value" else "Implied Share Price"
+        ws_sens["A1"] = f"{deal_name} - {metric_title} Sensitivity ({currency})"
         ws_sens["A1"].font = Font(name='Arial', size=14, bold=True)
         
         ws_sens["A3"] = "Sensitivity: WACC vs. Terminal Growth Rate"
         ws_sens["A3"].font = Font(name="Arial", bold=True)
         
-        share_price_row = current_row - 1
-        ws_sens["B4"] = f"='Valuation'!B{share_price_row}"
+        metric_row = current_row - 1
+        ws_sens["B4"] = f"='Valuation'!B{metric_row}"
         ws_sens["B4"].font = self.calc_font
         ws_sens["B4"].number_format = curr_fmt
         
@@ -292,9 +325,12 @@ class WorkbookBuilder:
                 tv_pv = tv / ((1 + w_test) ** len(projs))
                 ev = fcf_pv_sum + tv_pv
                 eq = ev - valuation.get("net_debt", 0)
-                price = eq / valuation.get("shares_outstanding", 1) if valuation.get("shares_outstanding", 1) > 0 else 0
+                if is_private_company or valuation_basis == "equity_value":
+                    metric_value = eq * (1 - liquidity_discount) * (1 + control_premium)
+                else:
+                    metric_value = eq / valuation.get("shares_outstanding", 1) if valuation.get("shares_outstanding", 1) > 0 else 0
                 
-                c = ws_sens.cell(row=5+r_idx, column=3+c_idx, value=price)
+                c = ws_sens.cell(row=5+r_idx, column=3+c_idx, value=metric_value)
                 c.number_format = curr_fmt
                 c.font = self.calc_font
 

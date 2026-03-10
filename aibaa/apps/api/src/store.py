@@ -18,7 +18,7 @@ class Output:
 
 @dataclass
 class ExtractionAudit:
-    """Per-field audit trail for the Maker-Checker extraction pipeline."""
+    """Per-field audit trail for the maker-checker extraction pipeline."""
     deal_id: str = ""
     agent_run_id: str = ""
     field_name: str = ""
@@ -26,10 +26,10 @@ class ExtractionAudit:
     confidence_score: float = 0.0
     source_citation: str = ""
     reasoning: str = ""
-    auditor_status: str = "pending"       # approved / flagged / rejected
+    auditor_status: str = "pending"
     auditor_confidence: float = 0.0
     auditor_reason: str = ""
-    triangulation_status: str = "skipped"  # pass / fail / skipped
+    triangulation_status: str = "skipped"
     triangulation_details: str = ""
     user_override: Any = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -93,7 +93,7 @@ class MemoryStore:
         self.agent_runs: Dict[str, AgentRun] = {}
         self.outputs: Dict[str, Output] = {}
         self.tasks: Dict[str, Task] = {}
-        self.extraction_audits: Dict[str, List[ExtractionAudit]] = {}  # run_id -> audits
+        self.extraction_audits: Dict[str, List[ExtractionAudit]] = {}
 
     def get_deal(self, deal_id: str) -> Optional[Deal]:
         target = self.deals.get(deal_id)

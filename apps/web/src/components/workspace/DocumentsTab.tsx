@@ -32,10 +32,14 @@ export default function DocumentsTab({ dealId }: Props) {
         setUploading(true)
         setError('')
         try {
-            await uploadDocuments(dealId, Array.from(files))
+            const result = await uploadDocuments(dealId, Array.from(files))
             await load()
+            if (result.failed.length > 0) {
+                setError(result.failed.map(f => `${f.filename}: ${f.reason}`).join(' | '))
+            }
         } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : 'Upload failed'
+            const maybeAxios = err as { response?: { data?: { detail?: string } }; message?: string }
+            const msg = maybeAxios?.response?.data?.detail || maybeAxios?.message || 'Upload failed'
             setError(msg)
         } finally {
             setUploading(false)
@@ -88,7 +92,7 @@ export default function DocumentsTab({ dealId }: Props) {
                             Drop files or click to browse
                         </p>
                         <p style={{ color: '#444', fontSize: 11, margin: 0 }}>
-                            PDF, DOCX, XLSX, CSV, JSON
+                            PDF, DOCX, XLSX, CSV, JSON · up to 150 MB
                         </p>
                     </>
                 )}

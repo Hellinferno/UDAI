@@ -1,4 +1,4 @@
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 
 class DCFEngine:
     """
@@ -18,6 +18,7 @@ class DCFEngine:
                  nwc_percent_rev: float = 0.10, da_percent_rev: float = 0.05,
                  revenue_cagr_override: float = None,
                  base_fy: int = 2025,
+                 tax_loss_carryforward: float = 0.0,
                  # Working capital assumptions
                  dso: float = 45.0,  # Days Sales Outstanding
                  dpo: float = 30.0,  # Days Payable Outstanding
@@ -36,6 +37,7 @@ class DCFEngine:
         self.da_percent_rev = da_percent_rev
         self.revenue_cagr_override = revenue_cagr_override
         self.base_fy = base_fy
+        self.tax_loss_carryforward = max(0.0, float(tax_loss_carryforward or 0.0))
         
         # Working capital days
         self.dso = dso
@@ -56,9 +58,10 @@ class DCFEngine:
 
     def calculate_wacc_breakdown(self, risk_free_rate: float = 0.07, equity_risk_premium: float = 0.06,
                                  beta: float = 1.1, cost_of_debt: float = 0.09,
-                                 debt_to_equity: float = 0.0) -> Dict[str, Any]:
+                                 debt_to_equity: float = 0.0, size_premium: float = 0.0,
+                                 specific_risk_premium: float = 0.0) -> Dict[str, Any]:
         """Calculates WACC components explicitly."""
-        cost_of_equity = risk_free_rate + (beta * equity_risk_premium)
+        cost_of_equity = risk_free_rate + (beta * equity_risk_premium) + size_premium + specific_risk_premium
         after_tax_cost_of_debt = cost_of_debt * (1 - self.tax_rate)
 
         weight_of_debt = debt_to_equity / (1 + debt_to_equity)
@@ -68,9 +71,12 @@ class DCFEngine:
 
         return {
             "wacc": round(wacc, 4),
+            "method": "capm",
             "risk_free_rate": risk_free_rate,
             "equity_risk_premium": equity_risk_premium,
             "beta": beta,
+            "size_premium": round(size_premium, 4),
+            "specific_risk_premium": round(specific_risk_premium, 4),
             "cost_of_equity": round(cost_of_equity, 4),
             "cost_of_debt": cost_of_debt,
             "after_tax_cost_of_debt": round(after_tax_cost_of_debt, 4),
@@ -78,6 +84,69 @@ class DCFEngine:
             "weight_of_equity": round(weight_of_equity, 4),
             "weight_of_debt": round(weight_of_debt, 4)
         }
+
+    def calculate_private_company_wacc_breakdown(
+        self,
+        risk_free_rate: float = 0.07,
+        equity_risk_premium: float = 0.065,
+        size_premium: float = 0.03,
+        specific_risk_premium: float = 0.04,
+        cost_of_debt: float = 0.09,
+        debt_to_equity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Build-up method for private-company cost of equity."""
+        cost_of_equity = risk_free_rate + equity_risk_premium + size_premium + specific_risk_premium
+        after_tax_cost_of_debt = cost_of_debt * (1 - self.tax_rate)
+
+        weight_of_debt = debt_to_equity / (1 + debt_to_equity)
+        weight_of_equity = 1 - weight_of_debt
+        wacc = (weight_of_equity * cost_of_equity) + (weight_of_debt * after_tax_cost_of_debt)
+
+        return {
+            "wacc": round(wacc, 4),
+            "method": "build_up",
+            "risk_free_rate": risk_free_rate,
+            "equity_risk_premium": equity_risk_premium,
+            "size_premium": size_premium,
+            "specific_risk_premium": specific_risk_premium,
+            "cost_of_equity": round(cost_of_equity, 4),
+            "cost_of_debt": cost_of_debt,
+            "after_tax_cost_of_debt": round(after_tax_cost_of_debt, 4),
+            "debt_to_equity": debt_to_equity,
+            "weight_of_equity": round(weight_of_equity, 4),
+            "weight_of_debt": round(weight_of_debt, 4),
+        }
+
+    def _build_margin_path(self, projection_years: int, scenario_adjustment: float) -> Tuple[List[float], float, float]:
+        """
+        Build a year-by-year EBITDA margin path.
+        Loss-making companies ramp gradually toward profitability instead of being
+        floored to an arbitrary positive margin in Year 1.
+        """
+        latest_margin = self.historical_ebitda_margins[-1]
+        avg_margin = sum(self.historical_ebitda_margins) / len(self.historical_ebitda_margins)
+        positive_history = [margin for margin in self.historical_ebitda_margins if margin > 0]
+
+        if latest_margin < 0 or avg_margin < 0:
+            positive_anchor = (
+                sum(positive_history) / len(positive_history)
+                if positive_history
+                else 0.10
+            )
+            target_margin = min(0.18, max(0.08, positive_anchor))
+            target_margin = max(-0.25, min(0.30, target_margin + scenario_adjustment))
+            start_margin = max(-0.50, min(0.30, latest_margin + (scenario_adjustment * 0.5)))
+        else:
+            start_margin = max(-0.10, min(0.30, latest_margin + (scenario_adjustment * 0.5)))
+            target_margin = max(-0.10, min(0.30, avg_margin + scenario_adjustment))
+
+        path = []
+        for idx in range(projection_years):
+            progress = (idx + 1) / projection_years
+            margin = start_margin + ((target_margin - start_margin) * progress)
+            path.append(round(max(-0.50, min(0.30, margin)), 6))
+
+        return path, latest_margin, target_margin
 
     def build_projections(self, projection_years: int = 7, terminal_growth_rate: float = 0.025,
                           scenario: str = 'base') -> Dict[str, Any]:
@@ -103,13 +172,14 @@ class DCFEngine:
             'bull': {'growth_multiplier': 1.3, 'margin_adjustment': 0.02, 'label': 'Bull Case'},
         }
         adj = scenario_adjustments.get(scenario, scenario_adjustments['base'])
-        
+
         # Apply scenario adjustments
         adjusted_cagr = revenue_cagr * adj['growth_multiplier']
-        adjusted_margin = avg_ebitda_margin + adj['margin_adjustment']
-        
-        # Floor margin at 5% (minimum viable business)
-        adjusted_margin = max(0.05, adjusted_margin)
+        margin_path, latest_margin, terminal_margin = self._build_margin_path(
+            projection_years,
+            adj['margin_adjustment'],
+        )
+        adjusted_margin = sum(margin_path) / len(margin_path)
 
         # 2. Year arrays
         fy_labels = []
@@ -129,12 +199,11 @@ class DCFEngine:
         projected_receivables = []
         projected_payables = []
         projected_inventory = []
-        
-        # Cost assumptions for working capital
-        cogs_percent_rev = 1.0 - adjusted_margin - self.da_percent_rev  # COGS = Revenue - EBITDA - D&A
-        
+        projected_tax_loss_carryforward = []
+
         last_revenue = self.historical_revenues[-1]
         last_nwc_balance = last_revenue * self.nwc_percent_rev
+        nol_balance = self.tax_loss_carryforward
 
         for year in range(1, projection_years + 1):
             fy_labels.append(f"FY{self.base_fy + year}E")
@@ -150,10 +219,10 @@ class DCFEngine:
             projected_revenues.append(round(current_rev, 2))
             revenue_growth_pct.append(round(current_growth * 100, 2))
 
-            # EBITDA with scenario-adjusted margin
-            current_ebitda = current_rev * adjusted_margin
+            current_margin = margin_path[year - 1]
+            current_ebitda = current_rev * current_margin
             projected_ebitda.append(round(current_ebitda, 2))
-            ebitda_margin_pct.append(round(adjusted_margin * 100, 2))
+            ebitda_margin_pct.append(round(current_margin * 100, 2))
 
             # D&A
             current_da = current_rev * self.da_percent_rev
@@ -163,9 +232,17 @@ class DCFEngine:
             current_ebit = current_ebitda - current_da
             projected_ebit.append(round(current_ebit, 2))
 
-            # Taxes
-            current_taxes = max(0, current_ebit * self.tax_rate)
+            # Taxes with NOL carryforward support
+            if current_ebit <= 0:
+                current_taxes = 0.0
+                nol_balance += abs(current_ebit)
+            else:
+                nol_utilized = min(nol_balance, current_ebit)
+                taxable_ebit = current_ebit - nol_utilized
+                nol_balance -= nol_utilized
+                current_taxes = max(0, taxable_ebit * self.tax_rate)
             projected_taxes.append(round(current_taxes, 2))
+            projected_tax_loss_carryforward.append(round(nol_balance, 2))
 
             # EBIAT
             current_ebiat = current_ebit - current_taxes
@@ -179,6 +256,7 @@ class DCFEngine:
             daily_revenue = current_rev / 365
             receivables = daily_revenue * self.dso
             
+            cogs_percent_rev = max(0.0, 1.0 - current_margin - self.da_percent_rev)
             daily_cogs = (current_rev * cogs_percent_rev) / 365
             payables = daily_cogs * self.dpo
             inventory = daily_cogs * self.dio
@@ -209,7 +287,10 @@ class DCFEngine:
                 "revenue_cagr": round(adjusted_cagr, 4),
                 "revenue_cagr_override": round(self.revenue_cagr_override, 4) if self.revenue_cagr_override is not None else None,
                 "avg_ebitda_margin": round(adjusted_margin, 4),
+                "latest_ebitda_margin": round(latest_margin, 4),
+                "terminal_ebitda_margin": round(terminal_margin, 4),
                 "tax_rate": round(self.tax_rate, 4),
+                "opening_tax_loss_carryforward": round(self.tax_loss_carryforward, 2),
                 "da_percent_rev": round(self.da_percent_rev, 4),
                 "cap_ex_percent_rev": round(self.cap_ex_percent_rev, 4),
                 "nwc_percent_rev": round(self.nwc_percent_rev, 4),
@@ -240,17 +321,20 @@ class DCFEngine:
                 "capex": projected_capex,
                 "nwc_change": projected_nwc_change,
                 "ufcf": projected_ufcf,
+                "tax_loss_carryforward_balance": projected_tax_loss_carryforward,
                 "receivables": projected_receivables,
                 "payables": projected_payables,
                 "inventory": projected_inventory
             }
         }
 
-    def calculate_valuation(self, ufcf_projections: List[float], wacc: float, terminal_growth_rate: float, 
-                           net_debt: float = 0, shares_outstanding: float = 1) -> Dict[str, Any]:
+    def calculate_valuation(self, ufcf_projections: List[float], wacc: float, terminal_growth_rate: float,
+                           net_debt: float = 0, shares_outstanding: Optional[float] = 1) -> Dict[str, Any]:
         """Calculates Terminal Value and Enterprise Value (EV)."""
         if not ufcf_projections:
             raise ValueError("UFCF projections are empty.")
+        if wacc <= terminal_growth_rate:
+            raise ValueError("WACC must exceed terminal growth rate")
 
         projection_years = len(ufcf_projections)
         final_year_ufcf = ufcf_projections[-1]
@@ -278,13 +362,15 @@ class DCFEngine:
 
         # Implied Equity Value & Share Price
         equity_value = implied_ev - net_debt
-        share_price = equity_value / shares_outstanding if shares_outstanding > 0 else 0
+        share_price = None
+        if shares_outstanding is not None and shares_outstanding > 0:
+            share_price = equity_value / shares_outstanding
 
         # Sanity checks
         warnings = []
         if equity_value < 0:
             warnings.append("NEGATIVE EQUITY VALUE: Check net_debt and EBITDA margin inputs.")
-        if share_price < 0:
+        if share_price is not None and share_price < 0:
             warnings.append("NEGATIVE SHARE PRICE: Model output is mathematically impossible for a going concern.")
         if pv_of_fcf < 0:
             warnings.append("NEGATIVE PV OF FCF: EBITDA margins may be too low relative to D&A and CapEx.")
@@ -301,7 +387,7 @@ class DCFEngine:
             "net_debt": net_debt,
             "implied_equity_value": round(equity_value, 2),
             "shares_outstanding": shares_outstanding,
-            "implied_share_price": round(share_price, 2),
+            "implied_share_price": round(share_price, 2) if share_price is not None else None,
             "warnings": warnings
         }
 
@@ -310,7 +396,7 @@ class DCFEngine:
     # ------------------------------------------------------------------
 
     def run_scenario_analysis(self, ufcf: List[float], wacc: float, tgr: float,
-                              net_debt: float, shares: float) -> Dict[str, Any]:
+                              net_debt: float, shares: Optional[float]) -> Dict[str, Any]:
         """Bear / Base / Bull scenarios with WACC shifts."""
         scenarios = {}
         configs = [
@@ -328,20 +414,33 @@ class DCFEngine:
             }
         return scenarios
 
-    def terminal_value_crosscheck(self, ufcf: List[float], wacc: float, tgr: float,
+    def terminal_value_crosscheck(self, ufcf: List[float], terminal_ebitda: Optional[float], wacc: float, tgr: float,
                                    exit_multiple: float = 12.0) -> Dict[str, Any]:
-        """Compare Gordon Growth TV with Exit Multiple TV."""
+        """Compare Gordon Growth TV with an EV/EBITDA terminal multiple."""
         final_fcf = ufcf[-1]
-        n = len(ufcf)
-
         gordon_tv = (final_fcf * (1 + tgr)) / (wacc - tgr)
-        exit_tv = final_fcf * exit_multiple
+        if terminal_ebitda is None or terminal_ebitda <= 0:
+            return {
+                "selected_method": "Gordon",
+                "terminal_metric": "EBITDA",
+                "terminal_metric_value": round(float(terminal_ebitda or 0), 2),
+                "gordon_tv": round(gordon_tv, 2),
+                "exit_multiple_tv": None,
+                "exit_multiple_used": exit_multiple,
+                "blended_tv": None,
+                "gordon_vs_multiple_gap_pct": None,
+                "note": "Exit multiple cross-check unavailable because terminal EBITDA is non-positive.",
+            }
+
+        exit_tv = terminal_ebitda * exit_multiple
         blended_tv = (gordon_tv + exit_tv) / 2
 
         gap_pct = ((gordon_tv - exit_tv) / exit_tv * 100) if exit_tv != 0 else 0
 
         return {
             "selected_method": "Gordon",
+            "terminal_metric": "EBITDA",
+            "terminal_metric_value": round(terminal_ebitda, 2),
             "gordon_tv": round(gordon_tv, 2),
             "exit_multiple_tv": round(exit_tv, 2),
             "exit_multiple_used": exit_multiple,
@@ -349,32 +448,34 @@ class DCFEngine:
             "gordon_vs_multiple_gap_pct": round(gap_pct, 2),
         }
 
-    def calculate_sbc_adjusted(self, equity_value: float, shares: float,
+    def calculate_sbc_adjusted(self, equity_value: float, shares: Optional[float],
                                 sbc_pct_rev: float, total_projected_revenue: float) -> Dict[str, Any]:
         """SBC dilution impact on share price."""
-        base_price = equity_value / shares if shares > 0 else 0
+        base_price = equity_value / shares if shares and shares > 0 else None
         total_sbc = total_projected_revenue * sbc_pct_rev
         adj_equity = equity_value - total_sbc
-        adj_price = adj_equity / shares if shares > 0 else 0
+        adj_price = adj_equity / shares if shares and shares > 0 else None
 
         return {
             "sbc_source": "Assumed stress case",
             "sbc_pct_revenue": sbc_pct_rev,
             "equity_value": round(adj_equity, 2),
-            "implied_price": round(adj_price, 2),
-            "price_impact_vs_no_sbc": round(adj_price - base_price, 2),
+            "implied_price": round(adj_price, 2) if adj_price is not None else None,
+            "price_impact_vs_no_sbc": round(adj_price - base_price, 2)
+            if adj_price is not None and base_price is not None
+            else None,
         }
 
     def calculate_margin_sensitivity(self, revs: List[float],
                                      wacc: float, tgr: float,
-                                     net_debt: float, shares: float,
+                                     net_debt: float, shares: Optional[float],
                                      base_margin: float) -> Dict[str, Any]:
         """Run scenarios using absolute EBITDA margin impacts."""
         results = []
 
         # We test margins at -2%, Base, and +2%
         margin_scenarios = [
-            (max(0.01, base_margin - 0.02), "Bear Case (-2% Margin)"),
+            (max(-0.50, base_margin - 0.02), "Bear Case (-2% Margin)"),
             (base_margin, "Base Case"),
             (base_margin + 0.02, "Bull Case (+2% Margin)")
         ]
@@ -408,7 +509,9 @@ class DCFEngine:
         return {"cases": results}
 
     def build_sensitivity_matrix(self, ufcf: List[float], wacc: float, tgr: float,
-                                  net_debt: float, shares: float) -> Dict[str, Any]:
+                                  net_debt: float, shares: Optional[float],
+                                  metric: str = "share_price",
+                                  adjustment_factor: float = 1.0) -> Dict[str, Any]:
         """WACC x Terminal Growth Rate two-way sensitivity table."""
         wacc_steps = [wacc - 0.02, wacc - 0.01, wacc, wacc + 0.01, wacc + 0.02]
         tgr_steps = [tgr - 0.01, tgr - 0.005, tgr, tgr + 0.005, tgr + 0.01]
@@ -417,24 +520,34 @@ class DCFEngine:
         for w in wacc_steps:
             row = []
             for t in tgr_steps:
+                if w <= t:
+                    row.append(None)
+                    continue
                 val = self.calculate_valuation(ufcf, w, t, net_debt, shares)
-                row.append(val["implied_share_price"])
+                value = val["implied_share_price"] if metric == "share_price" else val["implied_equity_value"]
+                row.append(round(value * adjustment_factor, 2) if value is not None else None)
             matrix.append(row)
 
         return {
             "wacc_headers": [round(w, 4) for w in wacc_steps],
             "tgr_headers": [round(t, 4) for t in tgr_steps],
             "matrix": matrix,
+            "metric": metric,
         }
 
     def calculate_capex_sensitivity(self, ufcf_base: List[float], revs: List[float],
-                                     wacc: float, tgr: float, net_debt: float, shares: float,
+                                     wacc: float, tgr: float, net_debt: float, shares: Optional[float],
                                      base_capex_pct: float) -> Dict[str, Any]:
         """Test sensitivity of valuation to CapEx intensity."""
         base_val = self.calculate_valuation(ufcf_base, wacc, tgr, net_debt, shares)
         base_price = base_val["implied_share_price"]
 
-        capex_scenarios = [0.08, 0.10, 0.12, 0.15]
+        capex_scenarios = sorted({
+            max(0.0, round(base_capex_pct - 0.01, 4)),
+            round(base_capex_pct, 4),
+            round(base_capex_pct + 0.01, 4),
+            round(base_capex_pct + 0.02, 4),
+        })
         results = []
 
         for new_pct in capex_scenarios:
@@ -458,12 +571,14 @@ class DCFEngine:
                 "equity_value": val["implied_equity_value"],
                 "implied_price": val["implied_share_price"],
                 "price_delta_vs_base": round(val["implied_share_price"] - base_price, 2)
+                if base_price is not None and val["implied_share_price"] is not None
+                else None
             })
 
         return {"cases": results}
 
-    def build_full_scenario_analysis(self, wacc: float, tgr: float, net_debt: float, 
-                                     shares: float, projection_years: int = 7) -> Dict[str, Any]:
+    def build_full_scenario_analysis(self, wacc: float, tgr: float, net_debt: float,
+                                     shares: Optional[float], projection_years: int = 7) -> Dict[str, Any]:
         """
         Build comprehensive 3-scenario analysis (Bear/Base/Bull) with full projections.
         Returns all scenario data for display.

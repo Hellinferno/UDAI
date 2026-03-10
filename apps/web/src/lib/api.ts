@@ -41,6 +41,11 @@ export interface DocumentInfo {
     uploaded_at: string;
 }
 
+export interface UploadFailure {
+    filename: string;
+    reason: string;
+}
+
 export interface AgentRunPayload {
     agent_type: string;
     task_name: string;
@@ -58,20 +63,27 @@ export interface ValuationResult {
     header: {
         enterprise_value: number;
         equity_value: number;
-        implied_share_price: number;
+        implied_share_price?: number | null;
         wacc: number;
         terminal_method: string;
         currency?: string;
+        valuation_basis?: 'share_price' | 'equity_value';
+        is_private_company?: boolean;
+        company_type?: string;
+        liquidity_discount?: number | null;
+        control_premium?: number | null;
+        projection_horizon_years?: number;
+        per_share_value_available?: boolean;
     };
     scenarios?: {
         bear: ScenarioCase;
         base: ScenarioCase;
         bull: ScenarioCase;
     };
-    ev_bridge?: Record<string, number>;
+    ev_bridge?: Record<string, number | boolean | string | null>;
     tv_crosscheck?: Record<string, unknown>;
-    sensitivity_wacc_tgr?: number[][];
-    sensitivity_labels?: { wacc: number[]; tgr: number[] };
+    sensitivity_wacc_tgr?: Array<Array<number | null>>;
+    sensitivity_labels?: { wacc: number[]; tgr: number[]; metric?: string };
     sbc_adjusted?: Record<string, unknown>;
     operating_leverage?: Record<string, unknown>;
     margin_sensitivity?: Record<string, unknown>;
@@ -103,8 +115,28 @@ export interface ValuationResult {
                 severity: string;
             }>;
         };
+        company_classification?: {
+            is_private_company: boolean;
+            entity_type: string;
+            listing_status: string;
+            cin?: string | null;
+            evidence?: string[];
+        };
         data_sources?: string[];
+        key_field_status?: {
+            shares_verified: boolean;
+            per_share_value_available: boolean;
+            tax_loss_carryforward_modeled: boolean;
+        };
     };
+    company_classification?: {
+        is_private_company: boolean;
+        entity_type: string;
+        listing_status: string;
+        cin?: string | null;
+        evidence?: string[];
+    };
+    warnings?: string[];
 }
 
 export interface ScenarioCase {
@@ -114,7 +146,7 @@ export interface ScenarioCase {
     valuation: {
         enterprise_value: number;
         equity_value: number;
-        share_price: number;
+        share_price?: number | null;
     };
 }
 
@@ -166,17 +198,25 @@ export async function fetchDocuments(dealId: string): Promise<DocumentInfo[]> {
     return res.data.data;
 }
 
-export async function uploadDocuments(dealId: string, files: File[], category?: string): Promise<DocumentInfo[]> {
+export async function uploadDocuments(
+    dealId: string,
+    files: File[],
+    category?: string
+): Promise<{ uploaded: DocumentInfo[]; failed: UploadFailure[] }> {
     const formData = new FormData();
     files.forEach((f) => formData.append('files', f));
     if (category) formData.append('category', category);
 
-    const res = await api.post<APIResponse<{ uploaded: DocumentInfo[] }>>(
+    const res = await api.post<APIResponse<{ uploaded: DocumentInfo[]; failed: UploadFailure[] }>>(
         `/deals/${dealId}/documents`,
         formData,
         { headers: { 'Content-Type': 'multipart/form-data' } }
     );
-    return res.data.data.uploaded;
+    const payload = res.data.data as { uploaded: DocumentInfo[]; failed?: UploadFailure[] };
+    return {
+        uploaded: payload.uploaded ?? [],
+        failed: payload.failed ?? [],
+    };
 }
 
 export async function deleteDocument(dealId: string, docId: string): Promise<void> {

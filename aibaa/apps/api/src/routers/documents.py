@@ -11,6 +11,8 @@ router = APIRouter(prefix="/deals/{deal_id}/documents", tags=["Documents"])
 
 UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../../../data/uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "150"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 @router.post("", response_model=APIResponse, status_code=status.HTTP_201_CREATED)
 async def upload_documents(
@@ -23,6 +25,7 @@ async def upload_documents(
         raise HTTPException(status_code=404, detail="Deal not found")
         
     uploaded_docs = []
+    failed_docs = []
     
     deal_upload_dir = os.path.join(UPLOAD_DIR, deal_id)
     os.makedirs(deal_upload_dir, exist_ok=True)
@@ -39,8 +42,10 @@ async def upload_documents(
         doc_type = file_extension if file_extension in supported_types else "unknown"
         
         if doc_type == "unknown":
-            print(f"[UPLOAD] REJECTED: unsupported type '{file_extension}'")
-            raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
+            reason = f"Unsupported file type: {file_extension}"
+            print(f"[UPLOAD] REJECTED: {reason}")
+            failed_docs.append({"filename": safe_filename, "reason": reason})
+            continue
         
         file_path = os.path.join(deal_upload_dir, f"{file_id}_{safe_filename}")
         
@@ -51,10 +56,14 @@ async def upload_documents(
             
             file_size = os.path.getsize(file_path)
             
-            # Enforce 50MB limit as per specs
-            if file_size > 50 * 1024 * 1024:
+            # Enforce configurable upload limit
+            if file_size > MAX_UPLOAD_BYTES:
                 os.remove(file_path) # Cleanup
-                raise HTTPException(status_code=413, detail=f"File {safe_filename} exceeds 50MB limit")
+                failed_docs.append({
+                    "filename": safe_filename,
+                    "reason": f"File exceeds {MAX_UPLOAD_MB}MB limit: {safe_filename}"
+                })
+                continue
                 
             # Create store entity
             new_doc = Document(
@@ -79,15 +88,19 @@ async def upload_documents(
             })
             
         except Exception as e:
-            # In a real app we would track failed documents in the array
             print(f"Failed to save file: {e}")
+            failed_docs.append({"filename": safe_filename, "reason": str(e)})
             continue
+
+    if not uploaded_docs and failed_docs:
+        detail = "; ".join(f"{item['filename']}: {item['reason']}" for item in failed_docs[:3])
+        raise HTTPException(status_code=400, detail=detail)
             
     return APIResponse(
         success=True,
         data={
             "uploaded": uploaded_docs,
-            "failed": []
+            "failed": failed_docs
         },
         meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")
     )

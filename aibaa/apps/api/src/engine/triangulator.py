@@ -1,84 +1,47 @@
 """
-Deterministic Double-Entry Triangulator.
+Deterministic accounting triangulation checks.
 
-Uses fundamental accounting identities to catch LLM extraction errors
-BEFORE they reach the DCF engine. No LLM involved — pure Python math.
+These checks validate extracted facts before they reach the DCF engine.
 """
 from typing import Dict, Any, Optional, List
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass
 class TriangulationResult:
-    """Result of a single accounting identity check."""
     identity_name: str
     passed: bool
     expected: float
     actual: float
     deviation_pct: float
     details: str
-    severity: str = "info"  # info, warning, critical
+    severity: str = "info"
 
 
 class Triangulator:
-    """
-    Validates extracted financial data using accounting identities.
-    If numbers deviate beyond tolerance, the extraction is flagged.
-    """
-
-    TOLERANCE = 0.05  # 5% margin of error
+    TOLERANCE = 0.05
 
     @classmethod
     def run_all_checks(cls, data: dict) -> Dict[str, Any]:
-        """
-        Run every applicable accounting identity check on extracted data.
-        Returns a summary with pass/fail per check and an overall verdict.
-        """
         results: List[TriangulationResult] = []
 
-        # 1. Net Debt Identity
-        r = cls.check_net_debt_identity(data)
-        if r:
-            results.append(r)
+        for check in (
+            cls.check_net_debt_identity,
+            cls.check_ebitda_reconciliation,
+            cls.check_revenue_margin_crosscheck,
+            cls.check_shares_sanity,
+            cls.check_de_consistency,
+            cls.check_cash_flow_triangulation,
+            cls.check_implied_ev_ebitda,
+            cls.check_lease_liability_inclusion,
+        ):
+            result = check(data)
+            if result:
+                results.append(result)
 
-        # 2. EBITDA Reconciliation
-        r = cls.check_ebitda_reconciliation(data)
-        if r:
-            results.append(r)
-
-        # 3. Revenue-Margin Cross-Check
-        r = cls.check_revenue_margin_crosscheck(data)
-        if r:
-            results.append(r)
-
-        # 4. Shares Sanity
-        r = cls.check_shares_sanity(data)
-        if r:
-            results.append(r)
-
-        # 5. Debt-to-Equity Consistency
-        r = cls.check_de_consistency(data)
-        if r:
-            results.append(r)
-
-        # 6. Cash Flow Triangulation
-        r = cls.check_cash_flow_triangulation(data)
-        if r:
-            results.append(r)
-
-        # 7. Implied EV/EBITDA Multiple
-        r = cls.check_implied_ev_ebitda(data)
-        if r:
-            results.append(r)
-
-        # 8. Lease Liability Inclusion (Ind AS 116)
-        r = cls.check_lease_liability_inclusion(data)
-        if r:
-            results.append(r)
-
-        passed = [r for r in results if r.passed]
-        failed = [r for r in results if not r.passed]
-        critical = [r for r in failed if r.severity == "critical"]
+        passed = [result for result in results if result.passed]
+        failed = [result for result in results if not result.passed]
+        critical = [result for result in failed if result.severity == "critical"]
 
         overall = "pass"
         if critical:
@@ -94,26 +57,22 @@ class Triangulator:
             "critical_failures": len(critical),
             "results": [
                 {
-                    "identity": r.identity_name,
-                    "passed": r.passed,
-                    "expected": round(r.expected, 2),
-                    "actual": round(r.actual, 2),
-                    "deviation_pct": round(r.deviation_pct, 2),
-                    "details": r.details,
-                    "severity": r.severity,
+                    "identity": result.identity_name,
+                    "passed": result.passed,
+                    "expected": round(result.expected, 2),
+                    "actual": round(result.actual, 2),
+                    "deviation_pct": round(result.deviation_pct, 2),
+                    "details": result.details,
+                    "severity": result.severity,
                 }
-                for r in results
+                for result in results
             ],
         }
 
-    # ------------------------------------------------------------------
-    # Individual Identity Checks
-    # ------------------------------------------------------------------
-
     @classmethod
     def check_net_debt_identity(cls, data: dict) -> Optional[TriangulationResult]:
-        """Net Debt = Total Borrowings − Cash & Equivalents"""
         borrowings = data.get("total_borrowings")
+        lease_liabilities = data.get("lease_liabilities", 0)
         cash = data.get("cash_and_equivalents")
         net_debt = data.get("net_debt")
 
@@ -122,39 +81,36 @@ class Triangulator:
 
         try:
             borrowings = float(borrowings)
+            lease_liabilities = float(lease_liabilities or 0)
             cash = float(cash)
             net_debt = float(net_debt)
         except (ValueError, TypeError):
             return None
 
-        expected = borrowings - cash
+        expected = borrowings + lease_liabilities - cash
         deviation = abs(expected - net_debt) / max(abs(expected), 1)
 
         return TriangulationResult(
-            identity_name="Net Debt = Borrowings − Cash",
+            identity_name="Net Debt = Borrowings + Leases - Cash",
             passed=deviation <= cls.TOLERANCE,
             expected=expected,
             actual=net_debt,
             deviation_pct=deviation * 100,
-            details=f"Borrowings={borrowings:,.0f}, Cash={cash:,.0f}, "
-                    f"Expected ND={expected:,.0f}, Reported ND={net_debt:,.0f}",
+            details=(
+                f"Borrowings={borrowings:,.0f}, Leases={lease_liabilities:,.0f}, Cash={cash:,.0f}, "
+                f"Expected ND={expected:,.0f}, Reported ND={net_debt:,.0f}"
+            ),
             severity="critical" if deviation > 0.20 else "warning",
         )
 
     @classmethod
     def check_ebitda_reconciliation(cls, data: dict) -> Optional[TriangulationResult]:
-        """
-        EBITDA ≈ Revenue × EBITDA Margin (for latest year).
-        Validates that the margin and revenue are internally consistent.
-        """
         revenues = data.get("historical_revenues")
         margins = data.get("historical_ebitda_margins")
 
         if not revenues or not margins:
             return None
         if not isinstance(revenues, list) or not isinstance(margins, list):
-            return None
-        if len(revenues) == 0 or len(margins) == 0:
             return None
 
         try:
@@ -167,42 +123,40 @@ class Triangulator:
             return None
 
         implied_ebitda = latest_rev * latest_margin
-
-        # If we have explicit EBITDA, compare
         explicit_ebitda = data.get("latest_ebitda")
+
         if explicit_ebitda is not None:
             try:
                 explicit_ebitda = float(explicit_ebitda)
                 deviation = abs(implied_ebitda - explicit_ebitda) / max(abs(explicit_ebitda), 1)
                 return TriangulationResult(
-                    identity_name="EBITDA = Revenue × Margin",
+                    identity_name="EBITDA = Revenue x Margin",
                     passed=deviation <= cls.TOLERANCE,
                     expected=implied_ebitda,
                     actual=explicit_ebitda,
                     deviation_pct=deviation * 100,
-                    details=f"Rev={latest_rev:,.0f}, Margin={latest_margin:.2%}, "
-                            f"Implied EBITDA={implied_ebitda:,.0f}, Reported={explicit_ebitda:,.0f}",
+                    details=(
+                        f"Rev={latest_rev:,.0f}, Margin={latest_margin:.2%}, "
+                        f"Implied EBITDA={implied_ebitda:,.0f}, Reported EBITDA={explicit_ebitda:,.0f}"
+                    ),
                     severity="warning",
                 )
             except (ValueError, TypeError):
                 pass
 
-        # Basic sanity: margin should be between -100% and +80%
         margin_ok = -1.0 <= latest_margin <= 0.80
         return TriangulationResult(
             identity_name="EBITDA Margin Range Check",
             passed=margin_ok,
-            expected=0.0,  # placeholder
+            expected=0.0,
             actual=latest_margin,
             deviation_pct=0.0 if margin_ok else abs(latest_margin) * 100,
-            details=f"Margin={latest_margin:.2%}, "
-                    f"{'within' if margin_ok else 'outside'} [-100%, +80%] range",
+            details=f"Margin={latest_margin:.2%}, {'within' if margin_ok else 'outside'} [-100%, +80%] range",
             severity="info" if margin_ok else "warning",
         )
 
     @classmethod
     def check_revenue_margin_crosscheck(cls, data: dict) -> Optional[TriangulationResult]:
-        """Check that revenue trend and margin arrays have equal length."""
         revenues = data.get("historical_revenues", [])
         margins = data.get("historical_ebitda_margins", [])
 
@@ -222,10 +176,6 @@ class Triangulator:
 
     @classmethod
     def check_shares_sanity(cls, data: dict) -> Optional[TriangulationResult]:
-        """
-        Shares outstanding should be between 4.2M (small-cap) and 6.4B (mega-cap).
-        Also cross-check: if share capital and face value are provided.
-        """
         shares = data.get("shares_outstanding")
         if shares is None:
             return None
@@ -235,64 +185,60 @@ class Triangulator:
         except (ValueError, TypeError):
             return None
 
-        MIN_SHARES = 4_200_000        # 42 Lakh (smallest listed cos)
-        MAX_SHARES = 6_400_000_000    # 640 Crore (TCS-class mega cap)
-
-        in_range = MIN_SHARES <= shares <= MAX_SHARES
+        min_shares = 4_200_000
+        max_shares = 6_400_000_000
+        in_range = min_shares <= shares <= max_shares
 
         return TriangulationResult(
             identity_name="Shares Outstanding Range Check",
             passed=in_range,
-            expected=(MIN_SHARES + MAX_SHARES) / 2,
+            expected=(min_shares + max_shares) / 2,
             actual=shares,
             deviation_pct=0.0 if in_range else 100.0,
-            details=f"Shares={shares:,.0f}, "
-                    f"Range=[{MIN_SHARES:,.0f}, {MAX_SHARES:,.0f}]",
+            details=f"Shares={shares:,.0f}, Range=[{min_shares:,.0f}, {max_shares:,.0f}]",
             severity="critical" if not in_range else "info",
         )
 
     @classmethod
     def check_de_consistency(cls, data: dict) -> Optional[TriangulationResult]:
-        """If borrowings=0, debt_to_equity must be 0."""
         borrowings = data.get("total_borrowings")
-        de = data.get("debt_to_equity")
+        lease_liabilities = data.get("lease_liabilities", 0)
+        debt_to_equity = data.get("debt_to_equity")
 
-        if borrowings is None or de is None:
+        if borrowings is None or debt_to_equity is None:
             return None
 
         try:
             borrowings = float(borrowings)
-            de = float(de)
+            lease_liabilities = float(lease_liabilities or 0)
+            debt_to_equity = float(debt_to_equity)
         except (ValueError, TypeError):
             return None
 
-        if borrowings <= 0 and de > 0:
+        total_debt = borrowings + lease_liabilities
+        if total_debt <= 0 and debt_to_equity > 0:
             return TriangulationResult(
-                identity_name="D/E Consistency (Zero-Debt)",
+                identity_name="D/E Consistency (Zero Debt)",
                 passed=False,
                 expected=0.0,
-                actual=de,
+                actual=debt_to_equity,
                 deviation_pct=100.0,
-                details=f"Borrowings={borrowings:,.0f} but D/E={de:.2f} (should be 0)",
+                details=f"Total debt={total_debt:,.0f} but D/E={debt_to_equity:.2f}; should be 0.",
                 severity="warning",
             )
 
         return TriangulationResult(
             identity_name="D/E Consistency",
             passed=True,
-            expected=de,
-            actual=de,
+            expected=debt_to_equity,
+            actual=debt_to_equity,
             deviation_pct=0.0,
-            details=f"Borrowings={borrowings:,.0f}, D/E={de:.2f} — consistent",
+            details=f"Total debt={total_debt:,.0f}, D/E={debt_to_equity:.2f} looks consistent.",
             severity="info",
         )
 
     @classmethod
     def check_cash_flow_triangulation(cls, data: dict) -> Optional[TriangulationResult]:
-        """
-        Net Income + D&A ± WC changes ≈ Operating Cash Flow.
-        Only runs if all 3 components are available.
-        """
         net_income = data.get("net_income")
         da = data.get("depreciation_amortization")
         ocf = data.get("operating_cash_flow")
@@ -307,43 +253,33 @@ class Triangulator:
         except (ValueError, TypeError):
             return None
 
-        # Simplified: NI + D&A should be within ~30% of OCF (WC changes can be large)
         implied_ocf = net_income + da
         deviation = abs(implied_ocf - ocf) / max(abs(ocf), 1)
 
         return TriangulationResult(
-            identity_name="Cash Flow Triangulation (NI + D&A ≈ OCF)",
-            passed=deviation <= 0.30,  # Wider tolerance due to WC
+            identity_name="Cash Flow Triangulation (NI + D&A ~= OCF)",
+            passed=deviation <= 0.30,
             expected=implied_ocf,
             actual=ocf,
             deviation_pct=deviation * 100,
-            details=f"NI={net_income:,.0f} + D&A={da:,.0f} = {implied_ocf:,.0f}, "
-                    f"OCF={ocf:,.0f}",
+            details=f"NI={net_income:,.0f} + D&A={da:,.0f} = {implied_ocf:,.0f}, OCF={ocf:,.0f}",
             severity="warning" if deviation > 0.30 else "info",
         )
 
     @classmethod
     def check_implied_ev_ebitda(cls, data: dict) -> Optional[TriangulationResult]:
-        """
-        Cross-check: If enterprise_value and terminal EBITDA are available,
-        compute the implied EV/EBITDA multiple. Flag if it's unreasonable.
-        
-        Typical ranges for Indian consumer discretionary: 15-30x
-        - Warning: <5x or >35x
-        - Critical: <3x or >50x  
-        """
-        ev = data.get("enterprise_value")
+        enterprise_value = data.get("enterprise_value")
         terminal_ebitda = data.get("terminal_ebitda")
-        
-        if ev is None or terminal_ebitda is None:
+
+        if enterprise_value is None or terminal_ebitda is None:
             return None
-        
+
         try:
-            ev = float(ev)
+            enterprise_value = float(enterprise_value)
             terminal_ebitda = float(terminal_ebitda)
         except (ValueError, TypeError):
             return None
-        
+
         if terminal_ebitda <= 0:
             return TriangulationResult(
                 identity_name="Implied EV/EBITDA Multiple",
@@ -351,71 +287,67 @@ class Triangulator:
                 expected=20.0,
                 actual=0.0,
                 deviation_pct=100.0,
-                details=f"Terminal EBITDA={terminal_ebitda:,.0f} is non-positive, cannot compute multiple",
+                details=f"Terminal EBITDA={terminal_ebitda:,.0f} is non-positive.",
                 severity="critical",
             )
-        
-        implied_multiple = ev / terminal_ebitda
-        
-        # Define reasonable ranges
+
+        implied_multiple = enterprise_value / terminal_ebitda
         if implied_multiple < 3.0 or implied_multiple > 50.0:
+            passed = False
             severity = "critical"
-            passed = False
         elif implied_multiple < 5.0 or implied_multiple > 35.0:
-            severity = "warning"
             passed = False
+            severity = "warning"
         else:
-            severity = "info"
             passed = True
-        
+            severity = "info"
+
         return TriangulationResult(
             identity_name="Implied EV/EBITDA Multiple",
             passed=passed,
-            expected=20.0,  # Midpoint of reasonable range
+            expected=20.0,
             actual=implied_multiple,
             deviation_pct=abs(implied_multiple - 20.0) / 20.0 * 100,
-            details=f"EV={ev:,.0f}, Terminal EBITDA={terminal_ebitda:,.0f}, "
-                    f"Implied Multiple={implied_multiple:.1f}x "
-                    f"({'reasonable' if passed else 'outside 5-35x range'})",
+            details=(
+                f"EV={enterprise_value:,.0f}, Terminal EBITDA={terminal_ebitda:,.0f}, "
+                f"Implied Multiple={implied_multiple:.1f}x"
+            ),
             severity=severity,
         )
 
     @classmethod
     def check_lease_liability_inclusion(cls, data: dict) -> Optional[TriangulationResult]:
-        """
-        If lease liabilities are present but net_debt doesn't include them,
-        flag the inconsistency.
-        """
-        lease = data.get("lease_liabilities")
+        lease_liabilities = data.get("lease_liabilities")
         borrowings = data.get("total_borrowings")
         cash = data.get("cash_and_equivalents")
         net_debt = data.get("net_debt")
-        
-        if lease is None or borrowings is None or cash is None or net_debt is None:
+
+        if lease_liabilities is None or borrowings is None or cash is None or net_debt is None:
             return None
-        
+
         try:
-            lease = float(lease)
+            lease_liabilities = float(lease_liabilities)
             borrowings = float(borrowings)
             cash = float(cash)
             net_debt = float(net_debt)
         except (ValueError, TypeError):
             return None
-        
-        if lease <= 0:
+
+        if lease_liabilities <= 0:
             return None
-        
-        expected_nd = borrowings + lease - cash
-        deviation = abs(expected_nd - net_debt) / max(abs(expected_nd), 1)
-        
+
+        expected = borrowings + lease_liabilities - cash
+        deviation = abs(expected - net_debt) / max(abs(expected), 1)
+
         return TriangulationResult(
-            identity_name="Net Debt includes Lease Liabilities (Ind AS 116)",
+            identity_name="Net Debt includes Lease Liabilities",
             passed=deviation <= cls.TOLERANCE,
-            expected=expected_nd,
+            expected=expected,
             actual=net_debt,
             deviation_pct=deviation * 100,
-            details=f"Borrowings={borrowings:,.0f} + Leases={lease:,.0f} - Cash={cash:,.0f} "
-                    f"= Expected ND={expected_nd:,.0f}, Actual ND={net_debt:,.0f}",
+            details=(
+                f"Borrowings={borrowings:,.0f} + Leases={lease_liabilities:,.0f} - Cash={cash:,.0f} "
+                f"= Expected ND={expected:,.0f}, Actual ND={net_debt:,.0f}"
+            ),
             severity="warning" if deviation > cls.TOLERANCE else "info",
         )
-
