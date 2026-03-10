@@ -1,15 +1,17 @@
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple
 import json
 import re
-import time
 import os
 
 from agents.base import BaseAgent
 from agents.prompt_builder import PromptBuilder
+from agents.extractor import PreparerAgent
+from agents.auditor import AuditorAgent
 from engine.dcf import DCFEngine
 from engine.llm import ask_llm
+from engine.triangulator import Triangulator
 from tools.excel_writer import WorkbookBuilder
-from store import store, Output
+from store import store, Output, ExtractionAudit
 
 
 class FinancialModelingAgent(BaseAgent):
@@ -18,7 +20,7 @@ class FinancialModelingAgent(BaseAgent):
             agent_type="modeling",
             task_name=input_payload.get("task_name", "dcf_model"),
             deal_id=deal_id,
-            input_payload=input_payload
+            input_payload=input_payload,
         )
         self.system_prompt = PromptBuilder.get_system_prompt(self.agent_type)
         self.excel_tool = WorkbookBuilder()
@@ -28,71 +30,57 @@ class FinancialModelingAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _extract_document_context(self) -> str:
-        """Fetch all parsed text from the deal's documents."""
         docs = store.get_documents_for_deal(self.deal_id)
         if not docs:
             return "No documents available."
         context = ""
-        for d in docs:
-            context += f"\\n--- Document: {d.filename} ---\\n"
-            context += d.parsed_text if d.parsed_text else "(Parsing incomplete or text unavailable)"
+        for doc in docs:
+            context += f"\n--- Document: {doc.filename} ---\n"
+            context += doc.parsed_text if doc.parsed_text else "(Parsing incomplete or text unavailable)"
         return context
 
-    def _resolve(self, param_key: str, params: dict, llm_data: dict,
-                 defaults: dict, *, cast=float, label: str = "") -> Tuple[Any, str]:
-        """
-        Resolve a value: Frontend param > LLM extraction > Generic default.
-        Returns (value, source_label).
-        """
+    def _resolve(
+        self,
+        param_key: str,
+        params: dict,
+        llm_data: dict,
+        defaults: dict,
+        *,
+        cast=float,
+        label: str = "",
+    ) -> Tuple[Any, str]:
         name = label or param_key
 
-        # 1. Frontend override
         override = params.get(param_key)
         if override is not None and override != "":
             return cast(override), f"{name}: user override"
 
-        # 2. LLM extraction
         llm_val = llm_data.get(param_key)
         if llm_val is not None and llm_val != "":
             try:
-                return cast(llm_val), f"{name}: LLM extracted"
+                return cast(llm_val), f"{name}: extracted"
             except (ValueError, TypeError):
                 pass
 
-        # 3. Generic default
         default = defaults.get(param_key)
         if default is not None:
             return cast(default), f"{name}: generic default"
 
         return None, f"{name}: missing"
 
-    # ------------------------------------------------------------------
-    # LLM Response Normalization — the key fix!
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _parse_llm_response(raw: str) -> dict:
-        """
-        Robustly parse LLM response that may contain markdown, thinking
-        blocks, or extra text around the JSON.
-        """
         text = raw.strip()
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        text = text.replace("```json", "").replace("```", "").strip()
 
-        # Strip DeepSeek <think>...</think> blocks
-        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-
-        # Strip markdown fences
-        text = text.replace('```json', '').replace('```', '').strip()
-
-        # Try direct parse first
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Find first { ... last } and try to extract JSON
-        first_brace = text.find('{')
-        last_brace = text.rfind('}')
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
         if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
             try:
                 return json.loads(text[first_brace:last_brace + 1])
@@ -102,111 +90,249 @@ class FinancialModelingAgent(BaseAgent):
         raise ValueError(f"Could not parse JSON from LLM response (length={len(raw)})")
 
     @staticmethod
-    def _normalize_revenues(revs: list) -> list:
+    def _normalize_revenues(revenues: list, reporting_unit: str = "") -> list:
         """
-        Auto-detect revenue units and convert to absolute INR.
+        Convert extracted revenues to absolute INR.
 
-        LLMs often return revenues in crores (e.g. 2789.61) or lakhs
-        instead of absolute INR (27,896,100,000).
+        Handles Indian number systems:
+        - Crores: multiply by 1e7
+        - Lakhs: multiply by 1e5
+        - Millions: multiply by 1e6
+        - Absolute: no conversion
 
-        Heuristics:
-        - If max value < 100,000 → likely in Crores, multiply by 1e7
-        - If max value < 10,000,000 → likely in Lakhs, multiply by 1e5
-        - Otherwise → already absolute INR
+        Uses reporting_unit hint when available, falls back to heuristic.
+        Guards against double-conversion by checking if values are already
+        in the plausible absolute INR range before applying any multiplier.
         """
-        if not revs or not all(isinstance(r, (int, float)) for r in revs):
-            return revs
+        if not revenues or not all(isinstance(value, (int, float)) for value in revenues):
+            return revenues
 
-        max_val = max(revs)
+        max_val = max(abs(value) for value in revenues)
+        if max_val < 1:
+            return revenues
 
-        if max_val < 100_000:
-            # Values like 2789.61 or 2500 → in Crores
-            return [r * 1e7 for r in revs]
-        elif max_val < 10_000_000:
-            # Values like 278961 → in Lakhs
-            return [r * 1e5 for r in revs]
-        else:
-            # Already in absolute numbers
-            return revs
+        plausible_min = 500_000_000        # ₹50 Cr (smallest company we'd model)
+        plausible_max = 20_000_000_000_000  # ₹20L Cr (larger than any Indian company)
+
+        # GUARD: If values are already in the plausible absolute INR range,
+        # do NOT apply any unit conversion regardless of reporting_unit.
+        # This prevents double-conversion when the LLM already converted to absolute.
+        if plausible_min <= max_val <= plausible_max:
+            return revenues
+
+        unit = (reporting_unit or "").lower().strip()
+
+        # If reporting unit explicitly specified, use it (with double-conversion guard)
+        if unit in ("crores", "crore", "cr"):
+            candidate = max_val * 1e7
+            if plausible_min <= candidate <= plausible_max:
+                return [value * 1e7 for value in revenues]
+        if unit in ("lakhs", "lakh", "lacs", "lac"):
+            candidate = max_val * 1e5
+            if plausible_min <= candidate <= plausible_max:
+                return [value * 1e5 for value in revenues]
+        if unit in ("millions", "million", "mn"):
+            candidate = max_val * 1e6
+            if plausible_min <= candidate <= plausible_max:
+                return [value * 1e6 for value in revenues]
+        if unit in ("absolute", "inr", "rupees"):
+            return revenues
+
+        # Heuristic: determine the most likely unit from the value scale.
+        # Indian company annual revenues (in absolute INR):
+        #   Small-cap: ₹1B-50B (10^9 to 5×10^10)
+        #   Mid-cap:   ₹50B-500B (5×10^10 to 5×10^11)
+        #   Large-cap: ₹500B-5T (5×10^11 to 5×10^12)
+        #   Mega-cap:  ₹5T-20T (5×10^12 to 2×10^13)
+        #
+        # In crores: small=100-5000, mid=5000-50000, large=50000-500000, mega=500000+
+        # In lakhs:  small=10000-500000, mid=500000-5000000, large=5000000+
+        #
+        # Strategy: try crores first (most common in Indian filings), then lakhs,
+        # then assume absolute. Validate that result falls in plausible range.
+
+        if max_val < 1_000_000:
+            # Values < 1M → most likely in crores
+            candidate_cr = max_val * 1e7
+            if plausible_min <= candidate_cr <= plausible_max:
+                return [value * 1e7 for value in revenues]
+            # Maybe lakhs for very small companies
+            candidate_lk = max_val * 1e5
+            if plausible_min <= candidate_lk <= plausible_max:
+                return [value * 1e5 for value in revenues]
+        elif max_val < 100_000_000:
+            # Values 1M-100M → could be lakhs (for large-cap) or crores (for mega-cap)
+            candidate_lk = max_val * 1e5
+            candidate_cr = max_val * 1e7
+            if plausible_min <= candidate_lk <= plausible_max and candidate_cr > plausible_max:
+                return [value * 1e5 for value in revenues]
+            if plausible_min <= candidate_cr <= plausible_max:
+                return [value * 1e7 for value in revenues]
+            if plausible_min <= candidate_lk <= plausible_max:
+                return [value * 1e5 for value in revenues]
+        elif max_val < 1_000_000_000:
+            # Values 100M-1B → likely lakhs, check
+            candidate_lk = max_val * 1e5
+            if plausible_min <= candidate_lk <= plausible_max:
+                return [value * 1e5 for value in revenues]
+
+        # If already in plausible absolute range, no conversion needed
+        return revenues
 
     @staticmethod
     def _normalize_margins(margins: list) -> list:
-        """
-        Auto-detect whether margins are decimals or percentages.
-
-        LLMs often return 13.69 instead of 0.1369.
-
-        Heuristic: if any |value| > 1.0, treat all as percentages and /100.
-        """
-        if not margins or not all(isinstance(m, (int, float)) for m in margins):
+        if not margins or not all(isinstance(value, (int, float)) for value in margins):
             return margins
-
-        if any(abs(m) > 1.0 for m in margins):
-            return [m / 100.0 for m in margins]
+        if any(abs(value) > 1.0 for value in margins):
+            return [value / 100.0 for value in margins]
         return margins
 
     @staticmethod
-    def _normalize_shares(shares) -> float:
+    def _normalize_shares(shares, profit_after_tax: float = None, basic_eps: float = None,
+                          revenues: list = None) -> float:
         """
-        Auto-detect shares unit and convert to absolute number.
+        Normalize shares outstanding to absolute count.
 
-        LLMs often return shares in crores (24.89) or millions (248.9)
-        instead of absolute (248,900,000).
+        Cross-checks with PAT/EPS if available:
+            implied_shares = profit_after_tax / basic_eps
 
-        Heuristics:
-        - < 1,000       → in Crores, multiply by 1e7
-        - < 100,000     → in Lakhs, multiply by 1e5
-        - < 10,000,000  → in Millions, keep as-is or multiply by 1e6
-        - Otherwise     → already absolute
+        Uses revenue scale to ensure PAT is in the same unit as revenues
+        before computing implied shares from EPS.
         """
+        min_shares = 4_200_000
+        max_shares = 10_000_000_000  # 10B (expanded for mega-cap Indian companies)
+
+        def _eps_implied_shares(pat: float, eps: float) -> float:
+            """Compute implied shares from PAT/EPS, handling PAT unit mismatch."""
+            if pat is None or eps is None or not isinstance(pat, (int, float)) or not isinstance(eps, (int, float)) or eps <= 0:
+                return 0.0
+            raw_implied = pat / eps
+            # If raw_implied is already in valid range, use it
+            if min_shares <= raw_implied <= max_shares:
+                return raw_implied
+            # PAT might be in Crores while EPS is per-share INR
+            # Try Crore conversion: raw_implied * 1e7
+            cr_implied = raw_implied * 1e7
+            if min_shares <= cr_implied <= max_shares:
+                return cr_implied
+            # Try Lakh conversion
+            lk_implied = raw_implied * 1e5
+            if min_shares <= lk_implied <= max_shares:
+                return lk_implied
+            return raw_implied
+
         if not isinstance(shares, (int, float)) or shares <= 0:
+            eps_shares = _eps_implied_shares(profit_after_tax, basic_eps)
+            if min_shares <= eps_shares <= max_shares:
+                return eps_shares
             return shares
 
-        if shares < 1_000:
-            # 24.89 → 24.89 Crore → 248,900,000
-            return shares * 1e7
-        elif shares < 100_000:
-            # 24890 → 24,890 (way too small for shares, probably in lakhs)
-            return shares * 1e5
-        elif shares < 1_000_000:
-            # 248900 → still small, probably in lakhs
-            return shares * 100
-        else:
-            # Already absolute: 248900000
+        if min_shares <= shares <= max_shares:
+            # Cross-check with EPS if available
+            eps_implied = _eps_implied_shares(profit_after_tax, basic_eps)
+            if min_shares <= eps_implied <= max_shares:
+                ratio = eps_implied / shares
+                if 0.8 <= ratio <= 1.2:
+                    return shares  # consistent
+                else:
+                    return eps_implied  # EPS-derived is more reliable
             return shares
 
-    @staticmethod
-    def _normalize_pct_field(val, field_name: str = "") -> float:
-        """
-        Normalize a percentage field that might be 4.0 (percent) vs 0.04 (decimal).
-        Fields like cap_ex_percent_rev, da_percent_rev should be 0.0-0.5 range.
-        """
-        if not isinstance(val, (int, float)):
-            return val
-        if val > 1.0:
-            # 4.0 → 0.04, 8.0 → 0.08
-            return val / 100.0
-        return val
+        if shares < 100:
+            candidate = shares * 1e7
+            return candidate if min_shares <= candidate <= max_shares else shares
+
+        if shares < 10_000:
+            candidate_crore = shares * 1e7
+            if min_shares <= candidate_crore <= max_shares:
+                return candidate_crore
+            candidate_lakh = shares * 1e5
+            if min_shares <= candidate_lakh <= max_shares:
+                return candidate_lakh
+            return shares
+
+        if shares < 100_000:
+            candidate = shares * 1e5
+            return candidate if min_shares <= candidate <= max_shares else shares
+
+        if shares < min_shares:
+            candidate = shares * 1_000
+            return candidate if min_shares <= candidate <= max_shares else shares
+
+        return shares
 
     @staticmethod
-    def _normalize_net_debt(val) -> float:
+    def _normalize_pct_field(value, field_name: str = "") -> float:
+        if not isinstance(value, (int, float)):
+            return value
+        if value > 1.0:
+            return value / 100.0
+        return value
+
+    @classmethod
+    def _normalize_balance_sheet_value(cls, value, revenues: list = None) -> float:
         """
-        Normalize net_debt: if it looks like crores (small number), convert.
+        Normalize a balance-sheet monetary value to absolute INR.
+
+        Uses revenue scale as an anchor: if we know revenues are in the
+        trillions, a balance-sheet value of 25,000 is almost certainly in
+        Crores (₹25,000 Cr = ₹250B), not absolute INR.
+
+        Prevents double-conversion by checking if the value is already
+        in a plausible absolute range relative to the revenue scale.
         """
-        if not isinstance(val, (int, float)):
-            return val
-        if abs(val) < 100_000 and val != 0:
-            # Likely in crores
-            return val * 1e7
-        return val
+        if not isinstance(value, (int, float)):
+            return value
+        if value == 0:
+            return value
+
+        abs_val = abs(value)
+
+        # If value is already very large (> ₹50 Cr absolute), assume it's absolute
+        if abs_val >= 500_000_000:
+            return value
+
+        # Use revenue scale to determine the right multiplier
+        if revenues and isinstance(revenues, list):
+            max_rev = max(abs(r) for r in revenues if isinstance(r, (int, float)))
+            if max_rev > 0:
+                # If revenue is in absolute range (>₹50Cr=500M), this BS value needs conversion
+                if max_rev >= 500_000_000:
+                    # Revenue is absolute; BS value < 500M likely needs crore conversion
+                    candidate_cr = abs_val * 1e7
+                    # BS value should be within reasonable proportion of revenue
+                    # (e.g. cash up to 50% of revenue, debt up to 200% of revenue)
+                    if candidate_cr <= max_rev * 3:
+                        return value * 1e7
+                    # Try lakh conversion for smaller values
+                    candidate_lk = abs_val * 1e5
+                    if candidate_lk <= max_rev * 3:
+                        return value * 1e5
+
+        # Legacy fallback: small values likely in Crores
+        if abs_val < 100_000:
+            return value * 1e7
+        return value
 
     @staticmethod
-    def _to_number(val) -> Optional[float]:
-        """Best-effort numeric coercion for JSON values that may arrive as strings."""
-        if isinstance(val, (int, float)):
-            return float(val)
-        if isinstance(val, str):
-            cleaned = val.strip().replace(",", "")
+    def _normalize_net_debt(value) -> float:
+        """Legacy wrapper - use _normalize_balance_sheet_value for better accuracy."""
+        if not isinstance(value, (int, float)):
+            return value
+        if value == 0:
+            return value
+        if abs(value) >= 500_000_000:
+            return value
+        if abs(value) < 100_000:
+            return value * 1e7
+        return value
+
+    @staticmethod
+    def _to_number(value) -> Optional[float]:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = value.strip().replace(",", "")
             if not cleaned or cleaned.lower() in {"na", "n/a", "null", "none", "-"}:
                 return None
             try:
@@ -217,35 +343,233 @@ class FinancialModelingAgent(BaseAgent):
 
     @classmethod
     def _enforce_capital_structure_consistency(cls, llm_data: dict) -> dict:
-        """
-        Keep debt assumptions internally consistent.
-        Priority:
-        1. If borrowings and cash exist, net_debt = borrowings - cash.
-        2. If borrowings are zero/nil, debt_to_equity must be 0.
-        """
         if not llm_data:
             return llm_data
 
         data = dict(llm_data)
         borrowings = cls._to_number(data.get("total_borrowings"))
+        ccps_liability = cls._to_number(data.get("ccps_liability"))
         cash = cls._to_number(data.get("cash_and_equivalents"))
         net_debt = cls._to_number(data.get("net_debt"))
         debt_to_equity = cls._to_number(data.get("debt_to_equity"))
+        lease_liabilities = cls._to_number(data.get("lease_liabilities"))
+
+        total_debt = (borrowings or 0) + (lease_liabilities or 0) + (ccps_liability or 0)
 
         if borrowings is not None and cash is not None:
-            implied_net_debt = borrowings - cash
-            data["net_debt"] = implied_net_debt
-            if borrowings <= 0:
+            data["net_debt"] = total_debt - cash
+            if total_debt <= 0:
                 data["debt_to_equity"] = 0.0
-        elif borrowings is not None and borrowings <= 0:
+        elif total_debt <= 0:
             data["debt_to_equity"] = 0.0
             if net_debt is not None and net_debt > 0:
                 data["net_debt"] = 0.0
 
-        if debt_to_equity is not None and debt_to_equity > 0 and borrowings is not None and borrowings <= 0:
+        if debt_to_equity is not None and debt_to_equity > 0 and total_debt <= 0:
             data["debt_to_equity"] = 0.0
 
         return data
+
+    @staticmethod
+    def _find_triangulation_match(field_name: str, results: list) -> dict:
+        normalized_field = field_name.replace("_", " ").lower()
+        field_aliases = {
+            "historical_revenues": ["revenue"],
+            "historical_ebitda_margins": ["ebitda"],
+            "net_debt": ["net debt"],
+            "total_borrowings": ["net debt", "debt"],
+            "lease_liabilities": ["lease"],
+            "cash_and_equivalents": ["net debt", "cash"],
+            "shares_outstanding": ["shares"],
+            "diluted_shares_outstanding": ["shares"],
+            "debt_to_equity": ["d/e", "debt"],
+            "cap_ex_percent_rev": ["cash flow", "capex"],
+            "da_percent_rev": ["ebitda", "d&a"],
+        }
+        candidates = field_aliases.get(field_name, [normalized_field])
+
+        for result in results:
+            identity = str(result.get("identity", "")).lower()
+            if any(candidate in identity for candidate in candidates):
+                return result
+        return {}
+
+    @staticmethod
+    def _get_audit_entry(field_name: str, audit_trail: list) -> dict:
+        for entry in audit_trail or []:
+            if entry.get("field") == field_name:
+                return entry
+        return {}
+
+    @classmethod
+    def _field_has_strong_support(cls, field_name: str, audit_trail: list, min_confidence: float = 0.75) -> bool:
+        entry = cls._get_audit_entry(field_name, audit_trail)
+        if not entry:
+            return False
+
+        confidence = float(entry.get("confidence") or 0.0)
+        source = str(entry.get("source_citation") or "").lower()
+        weak_markers = (
+            "without explicit citation",
+            "legacy extraction mode",
+            "deterministic fallback",
+            "not cited",
+        )
+
+        return confidence >= min_confidence and not any(marker in source for marker in weak_markers)
+
+    @staticmethod
+    def _estimate_tax_loss_carryforward(revenues: list, margins: list, da_percent_rev: float) -> float:
+        if not revenues or not margins:
+            return 0.0
+
+        estimated_nol = 0.0
+        for revenue, margin in zip(revenues, margins):
+            if not isinstance(revenue, (int, float)) or not isinstance(margin, (int, float)):
+                continue
+            ebit = revenue * (margin - da_percent_rev)
+            if ebit < 0:
+                estimated_nol += abs(ebit)
+
+        return estimated_nol
+
+    @staticmethod
+    def _infer_public_company_risk_overlay(industry: str, margins: list) -> dict:
+        industry_blob = (industry or "").lower()
+        high_beta_markers = (
+            "fintech",
+            "payments",
+            "digital",
+            "internet",
+            "technology",
+            "software",
+            "platform",
+            "e-commerce",
+            "ecommerce",
+            "marketplace",
+            "consumer internet",
+            "saas",
+        )
+        it_services_markers = (
+            "it services",
+            "it consulting",
+            "information technology",
+            "technology services",
+            "software services",
+            "systems integration",
+        )
+
+        latest_margin = margins[-1] if margins else 0.0
+        avg_margin = sum(margins) / len(margins) if margins else 0.0
+
+        beta_floor = 1.0
+        size_premium = 0.0
+        specific_risk_premium = 0.0
+        terminal_exit_multiple = 12.0
+        terminal_growth_premium = 0.0
+        min_projection_years = 5
+        reasons = []
+
+        # IT services companies get higher terminal growth and longer forecast
+        is_it_services = any(marker in industry_blob for marker in it_services_markers)
+        if is_it_services:
+            beta_floor = max(beta_floor, 0.85)
+            terminal_exit_multiple = max(terminal_exit_multiple, 18.0)
+            terminal_growth_premium = 0.005  # +0.5% terminal growth for IT
+            min_projection_years = max(min_projection_years, 7)
+            reasons.append("IT services sector overlay: higher terminal growth, longer forecast")
+        elif any(marker in industry_blob for marker in high_beta_markers):
+            beta_floor = max(beta_floor, 1.30)
+            size_premium = max(size_premium, 0.02)
+            specific_risk_premium = max(specific_risk_premium, 0.03)
+            terminal_exit_multiple = max(terminal_exit_multiple, 15.0)
+            reasons.append("sector risk overlay for high-beta digital business model")
+
+        if latest_margin < 0 or avg_margin < 0:
+            beta_floor = max(beta_floor, 1.25)
+            size_premium = max(size_premium, 0.02)
+            specific_risk_premium = max(specific_risk_premium, 0.03)
+            min_projection_years = max(min_projection_years, 7)
+            reasons.append("turnaround overlay for loss-making operating profile")
+
+        return {
+            "beta_floor": beta_floor,
+            "size_premium": size_premium,
+            "specific_risk_premium": specific_risk_premium,
+            "terminal_exit_multiple": terminal_exit_multiple,
+            "terminal_growth_premium": terminal_growth_premium,
+            "min_projection_years": min_projection_years,
+            "reasons": reasons,
+        }
+
+    @staticmethod
+    def _extract_cin(text: str) -> Optional[str]:
+        if not text:
+            return None
+        match = re.search(r"\b[LU]\d{5}[A-Z]{2}\d{4}(PTC|PLC)\d{6}\b", text.upper())
+        return match.group(0) if match else None
+
+    @classmethod
+    def _classify_company_context(cls, company_name: str, context: str, llm_data: dict) -> dict:
+        legal_form = str(llm_data.get("company_legal_form") or "").strip()
+        listing_status = str(llm_data.get("listing_status") or "").strip().lower()
+        cin = str(llm_data.get("cin") or cls._extract_cin(context) or "").strip().upper() or None
+
+        evidence = []
+        context_blob = (context or "").lower()
+        search_blob = " ".join(filter(None, [company_name, legal_form, listing_status, cin or "", context_blob])).lower()
+
+        is_private = False
+        entity_type = "unknown"
+
+        if "private limited" in search_blob or "pvt ltd" in search_blob or "private ltd" in search_blob:
+            is_private = True
+            entity_type = "private_limited"
+            evidence.append("Legal name indicates Private Limited status")
+
+        pre_ipo_markers = (
+            "pre-ipo",
+            "pre ipo",
+            "drhp",
+            "p-drhp",
+            "proposed listing",
+            "proposed bse",
+            "proposed nse",
+            "offer for sale",
+            "initial public offering",
+        )
+        if any(marker in search_blob for marker in pre_ipo_markers):
+            is_private = True
+            entity_type = "pre_ipo_unlisted"
+            evidence.append("Pre-IPO markers detected (DRHP/proposed listing disclosures)")
+
+        if cin and "PTC" in cin:
+            is_private = True
+            entity_type = "private_limited"
+            evidence.append(f"CIN {cin} contains PTC")
+        elif cin and "PLC" in cin and not is_private:
+            entity_type = "public_limited"
+            evidence.append(f"CIN {cin} contains PLC")
+
+        if listing_status in {"private", "unlisted"} and not is_private:
+            is_private = True
+            entity_type = "private_limited" if entity_type == "unknown" else entity_type
+            evidence.append(f"Listing status extracted as {listing_status}")
+        elif listing_status in {"public", "listed"} and entity_type == "unknown":
+            entity_type = "listed_public" if listing_status == "listed" else "public_limited"
+            evidence.append(f"Listing status extracted as {listing_status}")
+
+        if not is_private and entity_type == "unknown" and company_name.lower().endswith("limited"):
+            entity_type = "public_or_unclassified_limited"
+            evidence.append("Legal name ends with Limited but no private markers found")
+
+        return {
+            "is_private_company": is_private,
+            "entity_type": entity_type,
+            "listing_status": "private" if is_private else listing_status or "unknown",
+            "cin": cin,
+            "evidence": evidence,
+        }
 
     # ------------------------------------------------------------------
     # Main Agent Logic
@@ -258,341 +582,817 @@ class FinancialModelingAgent(BaseAgent):
             self.fail(f"Unsupported modeling task: {self.task_name}")
             return self.run_id
 
-        self.think("Extracting Context from Virtual Data Room.")
+        self.think("Extracting context from the virtual data room.")
         context = self._extract_document_context()
         self.observe(f"Extracted {len(context)} characters of document context.")
 
-        self.think("Building LLM instructions to query for Historical Extraction.")
         params = self.input_payload.get("parameters", {})
-
         deal = store.get_deal(self.deal_id)
         deal_name = deal.name if deal else "Unknown Deal"
         company_name = deal.company_name if deal else "the target company"
+        deal_industry = getattr(deal, "industry", "") if deal else ""
+        has_uploaded_documents = bool(store.get_documents_for_deal(self.deal_id))
 
-        # Explicit grounding to prevent phantom company hallucinations
-        context_header = f"CRITICALLY IMPORTANT: The target company is {company_name} (Deal: {deal_name}).\\n"
-        context_header += "1. Do not extract data for any other entity.\\n"
-        context_header += "2. Extract exactly 5 YEARS of historical revenue and EBITDA margins to establish trends.\\n"
-        context_header += "3. Search thoroughly for Total Debt, Borrowings, and Cash on the balance sheet. Do not blindly assume $0 Net Debt.\\n"
-        context_header += "4. Extract CapEx from Cash Flow Statement and D&A from Profit & Loss separately.\\n"
-        context_header += "5. Calculate Debt-to-Equity from Balance Sheet. If zero debt, return 0.0.\\n\\n"
-        prompt = PromptBuilder.build_modeling_dcf_prompt(params, context_header + context)
+        context_header = f"CRITICALLY IMPORTANT: The target company is {company_name} (Deal: {deal_name}).\n"
+        context_header += "1. Do not extract data for any other entity.\n"
+        context_header += "2. Extract exactly 5 years of historical revenue and EBITDA margins when available.\n"
+        context_header += "3. Search thoroughly for total debt, borrowings, lease liabilities, and cash.\n"
+        context_header += "   For IT services / technology companies, cash + investments is often 30-60% of revenue.\n"
+        context_header += "   Include ALL of: cash, bank balances, current investments, non-current liquid investments, term deposits.\n"
+        context_header += "4. Extract CapEx from the cash flow statement and D&A from the profit and loss statement separately.\n"
+        context_header += "5. Calculate debt-to-equity from the balance sheet. If the company is debt-free, return 0.0.\n"
+        context_header += "6. Extract operating cash flow (net cash from operating activities) from the cash flow statement.\n"
+        context_header += "7. Extract Profit After Tax and Basic EPS for shares cross-check.\n\n"
+        full_context = context_header + context
+        legacy_prompt = PromptBuilder.build_modeling_dcf_prompt(params, full_context)
 
-        # ═══════════════════════════════════════════════════════════════
-        # GENERIC FALLBACK DEFAULTS — Used ONLY when LLM extraction
-        # fails AND no user overrides provided.
-        # ═══════════════════════════════════════════════════════════════
-        GENERIC_DEFAULTS = {
+        generic_defaults = {
             "historical_revenues": [150_000_000_000, 180_000_000_000, 200_000_000_000, 220_000_000_000, 250_000_000_000],
             "historical_ebitda_margins": [0.12, 0.12, 0.12, 0.12, 0.12],
             "net_debt": 0,
-            "shares_outstanding": 100_000_000,
             "total_borrowings": 0,
+            "ccps_liability": 0,
+            "lease_liabilities": 0,
             "cash_and_equivalents": 0,
             "cap_ex_percent_rev": 0.03,
             "da_percent_rev": 0.056,
             "debt_to_equity": 0.0,
             "beta": 1.0,
+            "size_premium": 0.03,
+            "specific_risk_premium": 0.04,
+            "liquidity_discount": 0.25,
+            "control_premium": 0.0,
             "base_fy": 2025,
             "currency": "INR",
         }
 
-        # ─── LLM Extraction ───────────────────────────────────
         llm_data = {}
         fallback_mode = False
         fallback_profile = ""
-        self.act("llm_inference", "Sending VDR context to Gemini 2.5 Flash for parameter extraction")
+        extraction_mode = "none"
+        extraction_audit_trail = []
+        auditor_verdicts = []
+        triangulation_result = {}
+        preparer_output = {}
+        auditor_status = "skipped"
+
+        self.think("[Stage 1/3] Running preparer extraction with reconciliation prompting.")
+        self.act("preparer_agent", "Extracting financial data with citations and confidence scores")
         try:
-            raw_response = ask_llm(self.system_prompt, prompt)
-            self.observe(f"Raw LLM response (first 500 chars): {raw_response[:500]}")
-            llm_data = self._parse_llm_response(raw_response)
-            fallback_mode = str(llm_data.get("extraction_mode", "")).lower() == "deterministic_fallback"
+            preparer_output = PreparerAgent.extract(
+                system_prompt=self.system_prompt,
+                document_context=full_context,
+                params=params,
+                company_name=company_name,
+            )
+            llm_data = preparer_output.get("extracted_data", {})
+            extraction_audit_trail = preparer_output.get("audit_trail", [])
+            extraction_mode = preparer_output.get("extraction_mode", "llm")
+            fallback_mode = str(extraction_mode).lower() == "deterministic_fallback"
             fallback_profile = str(llm_data.get("fallback_profile", ""))
-            self.observe(f"LLM extraction parsed: {json.dumps(llm_data)}")
-        except Exception as e:
-            self.observe(f"LLM extraction failed ({str(e)}). Will use generic defaults.")
+            self.observe(
+                f"Preparer extracted {len(llm_data)} fields with {len(extraction_audit_trail)} audit entries."
+            )
+        except Exception as exc:
+            self.observe(f"Preparer extraction failed ({exc}).")
             llm_data = {}
 
-        # ─── NORMALIZE LLM DATA (the critical fix!) ───────────
-        if llm_data:
-            # Revenues: auto-detect crores/lakhs/absolute
-            if llm_data.get("historical_revenues"):
-                raw_revs = llm_data["historical_revenues"]
-                llm_data["historical_revenues"] = self._normalize_revenues(raw_revs)
-                if raw_revs != llm_data["historical_revenues"]:
-                    self.observe(f"Auto-normalized revenues: {raw_revs} → {llm_data['historical_revenues']}")
+        if not llm_data:
+            self.observe("Preparer returned no usable data. Retrying with legacy extraction prompt.")
+            self.act("llm_inference", "Running legacy financial extraction fallback")
+            try:
+                raw_response = ask_llm(self.system_prompt, legacy_prompt)
+                llm_data = self._parse_llm_response(raw_response)
+                extraction_mode = str(llm_data.get("extraction_mode", "legacy_llm"))
+                fallback_mode = extraction_mode.lower() == "deterministic_fallback"
+                fallback_profile = str(llm_data.get("fallback_profile", ""))
+                extraction_audit_trail = [
+                    {
+                        "field": key,
+                        "value": value,
+                        "confidence": 0.4 if value is not None else 0.0,
+                        "source_citation": "Legacy extraction mode without per-field citations",
+                        "reasoning": "",
+                    }
+                    for key, value in llm_data.items()
+                    if key not in {"currency", "extraction_mode", "fallback_profile"}
+                ]
+                self.observe(f"Legacy extraction parsed {len(llm_data)} fields.")
+            except Exception as exc:
+                self.observe(f"Legacy extraction also failed ({exc}). Will use generic defaults.")
+                llm_data = {}
+                extraction_audit_trail = []
 
-            # EBITDA margins: auto-detect percentages vs decimals
+        if llm_data and extraction_audit_trail:
+            self.think("[Stage 2/3] Running auditor verification on extracted fields.")
+            self.act("auditor_agent", "Verifying citations and accounting logic")
+            try:
+                auditor_result = AuditorAgent.audit(
+                    system_prompt=PromptBuilder.get_system_prompt("auditor"),
+                    preparer_output=preparer_output
+                    if preparer_output
+                    else {
+                        "extracted_data": llm_data,
+                        "audit_trail": extraction_audit_trail,
+                        "reconciliation_log": "",
+                        "extraction_mode": extraction_mode,
+                    },
+                    company_name=company_name,
+                )
+                auditor_verdicts = auditor_result.get("field_verdicts", [])
+                auditor_status = auditor_result.get("overall_status", "flagged")
+                corrections = auditor_result.get("corrections", {})
+                if corrections:
+                    llm_data = AuditorAgent.merge_corrections(llm_data, auditor_result)
+                    self.observe(f"Auditor applied corrections to: {list(corrections.keys())}")
+                self.observe(
+                    f"Auditor verdict: {auditor_status} with {len(auditor_verdicts)} field checks."
+                )
+            except Exception as exc:
+                auditor_status = "flagged"
+                self.observe(f"Auditor stage failed ({exc}). Proceeding with extracted data.")
+        else:
+            self.observe("Skipping auditor stage because there is no extracted data or audit trail.")
+
+        if llm_data:
+            reporting_unit = str(llm_data.get("reporting_unit") or "")
+
+            if llm_data.get("historical_revenues"):
+                raw_revenues = llm_data["historical_revenues"]
+                llm_data["historical_revenues"] = self._normalize_revenues(raw_revenues, reporting_unit)
+                if raw_revenues != llm_data["historical_revenues"]:
+                    self.observe(f"Auto-normalized revenues: {raw_revenues} -> {llm_data['historical_revenues']}")
+
             if llm_data.get("historical_ebitda_margins"):
                 raw_margins = llm_data["historical_ebitda_margins"]
                 llm_data["historical_ebitda_margins"] = self._normalize_margins(raw_margins)
                 if raw_margins != llm_data["historical_ebitda_margins"]:
-                    self.observe(f"Auto-normalized margins: {raw_margins} → {llm_data['historical_ebitda_margins']}")
+                    self.observe(f"Auto-normalized margins: {raw_margins} -> {llm_data['historical_ebitda_margins']}")
 
-            # Shares outstanding: auto-detect crores/millions/absolute
-            if llm_data.get("shares_outstanding"):
-                raw_shares = llm_data["shares_outstanding"]
-                llm_data["shares_outstanding"] = self._normalize_shares(raw_shares)
-                if raw_shares != llm_data["shares_outstanding"]:
-                    self.observe(f"Auto-normalized shares: {raw_shares} → {llm_data['shares_outstanding']}")
+            for share_field in ("shares_outstanding", "diluted_shares_outstanding"):
+                if llm_data.get(share_field):
+                    raw_shares = llm_data[share_field]
+                    pat = self._to_number(llm_data.get("profit_after_tax"))
+                    eps = self._to_number(llm_data.get("basic_eps"))
+                    norm_revs = llm_data.get("historical_revenues", [])
+                    llm_data[share_field] = self._normalize_shares(raw_shares, pat, eps, norm_revs)
+                    if raw_shares != llm_data[share_field]:
+                        self.observe(f"Auto-normalized {share_field}: {raw_shares} -> {llm_data[share_field]}")
 
-            # Net debt: auto-detect crores/absolute
+            # Use normalized revenues as anchor for balance sheet normalization
+            normalized_revenues = llm_data.get("historical_revenues", [])
+
             if llm_data.get("net_debt") is not None:
                 raw_nd = llm_data["net_debt"]
-                llm_data["net_debt"] = self._normalize_net_debt(raw_nd)
+                llm_data["net_debt"] = self._normalize_balance_sheet_value(raw_nd, normalized_revenues)
+                if raw_nd != llm_data["net_debt"]:
+                    self.observe(f"Auto-normalized net_debt: {raw_nd} -> {llm_data['net_debt']}")
 
-            # CapEx, D&A as percentages: auto-detect 4.0 vs 0.04
-            for pct_field in ["cap_ex_percent_rev", "da_percent_rev"]:
+            for pct_field in ("cap_ex_percent_rev", "da_percent_rev"):
                 if llm_data.get(pct_field) is not None:
-                    raw_val = llm_data[pct_field]
-                    llm_data[pct_field] = self._normalize_pct_field(raw_val, pct_field)
-                    if raw_val != llm_data[pct_field]:
-                        self.observe(f"Auto-normalized {pct_field}: {raw_val} → {llm_data[pct_field]}")
+                    raw_value = llm_data[pct_field]
+                    llm_data[pct_field] = self._normalize_pct_field(raw_value, pct_field)
+                    if raw_value != llm_data[pct_field]:
+                        self.observe(f"Auto-normalized {pct_field}: {raw_value} -> {llm_data[pct_field]}")
 
-            # Total borrowings / cash: normalize from crores if needed
-            for debt_field in ["total_borrowings", "cash_and_equivalents"]:
+            for debt_field in ("total_borrowings", "cash_and_equivalents", "lease_liabilities", "ccps_liability"):
                 if llm_data.get(debt_field) is not None:
-                    llm_data[debt_field] = self._normalize_net_debt(llm_data[debt_field])
+                    raw_val = llm_data[debt_field]
+                    llm_data[debt_field] = self._normalize_balance_sheet_value(raw_val, normalized_revenues)
+                    if raw_val != llm_data[debt_field]:
+                        self.observe(f"Auto-normalized {debt_field}: {raw_val} -> {llm_data[debt_field]}")
 
             llm_data = self._enforce_capital_structure_consistency(llm_data)
             if fallback_mode:
                 self.observe(f"Using deterministic fallback profile: {fallback_profile or 'default'}")
+            self.observe(f"Normalized extraction payload: {json.dumps(llm_data)}")
 
-            self.observe(f"Normalized LLM data: {json.dumps(llm_data)}")
+        if has_uploaded_documents and fallback_mode:
+            self.observe(
+                "Document extraction fell back to a deterministic profile. "
+                "Continuing in fallback mode and marking output as low-confidence."
+            )
 
-        # ─── Resolve Revenue & Margins ─────────────────────────
+        company_context = self._classify_company_context(company_name, context, llm_data)
+        if company_context["evidence"]:
+            self.observe(
+                f"Company classification: {company_context['entity_type']} "
+                f"({'private' if company_context['is_private_company'] else 'public/unknown'}) "
+                f"via {', '.join(company_context['evidence'])}"
+            )
+
+        if llm_data:
+            self.think("[Stage 3/3] Running deterministic accounting triangulation checks.")
+            self.act("triangulator", "Checking net debt, shares, EBITDA, and D/E consistency")
+            triangulation_result = Triangulator.run_all_checks(llm_data)
+            self.observe(
+                f"Triangulation verdict: {triangulation_result.get('overall_verdict', 'unknown')} "
+                f"({triangulation_result.get('passed', 0)}/{triangulation_result.get('total_checks', 0)} passed)."
+            )
+        else:
+            self.observe("Skipping triangulation because there is no extracted data.")
+
+        audit_records = []
+        for entry in extraction_audit_trail:
+            field_name = entry.get("field", "unknown")
+            auditor_match = next(
+                (verdict for verdict in auditor_verdicts if verdict.get("field") == field_name),
+                {},
+            )
+            triangulation_match = self._find_triangulation_match(
+                field_name,
+                triangulation_result.get("results", []),
+            )
+            audit_records.append(
+                ExtractionAudit(
+                    deal_id=self.deal_id,
+                    agent_run_id=self.run_id,
+                    field_name=field_name,
+                    extracted_value=entry.get("value"),
+                    confidence_score=entry.get("confidence", 0.5),
+                    source_citation=entry.get("source_citation", ""),
+                    reasoning=entry.get("reasoning", ""),
+                    auditor_status=auditor_match.get("status", "pending"),
+                    auditor_confidence=auditor_match.get("auditor_confidence", 0.0),
+                    auditor_reason=auditor_match.get("reason", ""),
+                    triangulation_status="pass" if triangulation_match.get("passed", True) else "fail",
+                    triangulation_details=triangulation_match.get("details", ""),
+                )
+            )
+        store.extraction_audits[self.run_id] = audit_records
+        if audit_records:
+            self.observe(f"Stored {len(audit_records)} extraction audit records.")
+
         data_sources = []
-
-        historical_revenues = GENERIC_DEFAULTS["historical_revenues"]
-        historical_ebitda_margins = GENERIC_DEFAULTS["historical_ebitda_margins"]
+        historical_revenues = generic_defaults["historical_revenues"]
+        historical_ebitda_margins = generic_defaults["historical_ebitda_margins"]
 
         if llm_data.get("historical_revenues"):
-            llm_revs = llm_data["historical_revenues"]
-            # Sanity: list of 2+ numbers, each > ₹10 Cr (100M) after normalization
-            if isinstance(llm_revs, list) and len(llm_revs) >= 2 and all(
-                isinstance(r, (int, float)) and r > 100_000_000 for r in llm_revs
+            candidate_revenues = llm_data["historical_revenues"]
+            if (
+                isinstance(candidate_revenues, list)
+                and len(candidate_revenues) >= 2
+                and all(isinstance(value, (int, float)) and value > 100_000_000 for value in candidate_revenues)
             ):
-                if len(set([round(r, -7) for r in llm_revs])) == 1:
-                    self.observe(f"LLM revenues look flat ({llm_revs}), using generic defaults")
-                    data_sources.append("historical_revenues: generic default (flat)")
+                if len({round(value, -7) for value in candidate_revenues}) == 1:
+                    self.observe(f"Extracted revenues look flat ({candidate_revenues}); using generic defaults.")
+                    data_sources.append("historical_revenues: generic default (flat extraction)")
                 else:
-                    historical_revenues = llm_revs
-                    self.observe(f"Using LLM-extracted revenues: {llm_revs}")
-                    data_sources.append("historical_revenues: LLM extracted")
+                    historical_revenues = candidate_revenues
+                    data_sources.append("historical_revenues: extracted")
             else:
-                self.observe(f"LLM revenues failed sanity ({llm_revs}), using generic defaults")
+                self.observe(f"Extracted revenues failed sanity ({candidate_revenues}); using generic defaults.")
                 data_sources.append("historical_revenues: generic default (sanity failed)")
         else:
-            data_sources.append("historical_revenues: generic default (LLM missing)")
+            data_sources.append("historical_revenues: generic default (missing)")
 
         if llm_data.get("historical_ebitda_margins"):
-            llm_margins = llm_data["historical_ebitda_margins"]
-            # After normalization, margins should be decimals in -2.0 to 0.99
-            if isinstance(llm_margins, list) and len(llm_margins) >= 2 and all(
-                isinstance(m, (int, float)) and -2.0 < m < 0.99 for m in llm_margins
+            candidate_margins = llm_data["historical_ebitda_margins"]
+            if (
+                isinstance(candidate_margins, list)
+                and len(candidate_margins) >= 2
+                and all(isinstance(value, (int, float)) and -2.0 < value < 0.99 for value in candidate_margins)
             ):
-                historical_ebitda_margins = llm_margins
-                self.observe(f"Using LLM-extracted margins: {llm_margins}")
-                data_sources.append("historical_ebitda_margins: LLM extracted")
+                historical_ebitda_margins = candidate_margins
+                data_sources.append("historical_ebitda_margins: extracted")
             else:
-                self.observe(f"LLM margins failed sanity ({llm_margins}), using generic defaults")
+                self.observe(f"Extracted margins failed sanity ({candidate_margins}); using generic defaults.")
                 data_sources.append("historical_ebitda_margins: generic default (sanity failed)")
         else:
-            data_sources.append("historical_ebitda_margins: generic default (LLM missing)")
+            data_sources.append("historical_ebitda_margins: generic default (missing)")
 
-        # ─── DCF Computation ───────────────────────────────────
-        self.think("Engaging deterministic DCF Computation Engine.")
-        self.act("python_exec", "Instantiating DCFEngine and calculating WACC/UFCF")
+        if has_uploaded_documents:
+            missing_required_fields = []
+            if historical_revenues == generic_defaults["historical_revenues"]:
+                missing_required_fields.append("historical revenues")
+            if historical_ebitda_margins == generic_defaults["historical_ebitda_margins"]:
+                missing_required_fields.append("historical EBITDA margins")
+
+            if missing_required_fields and not fallback_mode:
+                self.fail(
+                    "Uploaded documents did not yield verified "
+                    + ", ".join(missing_required_fields)
+                    + ". DCF aborted instead of using generic company assumptions."
+                )
+                return self.run_id
+
+        if len(historical_revenues) >= 2:
+            latest_revenue = historical_revenues[-1]
+            previous_revenue = historical_revenues[-2]
+            if previous_revenue > 0:
+                latest_yoy = (latest_revenue - previous_revenue) / previous_revenue
+                first_revenue = historical_revenues[0]
+                year_count = len(historical_revenues) - 1
+                historical_cagr = (
+                    (latest_revenue / first_revenue) ** (1.0 / year_count) - 1.0
+                    if first_revenue > 0 and year_count > 0
+                    else latest_yoy
+                )
+                if latest_yoy < 0.02 and not params.get("revenue_cagr_override"):
+                    conservative_cagr = max(min(historical_cagr, 0.06), 0.02)
+                    params["revenue_cagr_override_auto"] = conservative_cagr
+                    data_sources.append(
+                        f"growth_sanity: auto-capped CAGR to {conservative_cagr * 100:.1f}% "
+                        f"(latest YoY={latest_yoy * 100:.1f}%)"
+                    )
+                    self.observe(
+                        f"Growth sanity check triggered: latest YoY={latest_yoy * 100:.1f}%, "
+                        f"historical CAGR={historical_cagr * 100:.1f}%, auto-capped to {conservative_cagr * 100:.1f}%."
+                    )
+
+        self.think("Engaging deterministic DCF computation engine.")
+        self.act("python_exec", "Instantiating DCFEngine and calculating WACC and UFCF")
         try:
-            tgr = params.get("terminal_growth_rate", 0.025)
+            is_private_company = company_context["is_private_company"]
+            terminal_growth_rate = params.get("terminal_growth_rate", 0.025)
 
-            # WACC components
-            risk_free_rate, _ = self._resolve("risk_free_rate", params, llm_data, GENERIC_DEFAULTS, label="risk_free_rate")
+            terminal_growth_reference = self._to_number(llm_data.get("terminal_growth_reference"))
+            if (
+                is_private_company
+                and terminal_growth_reference is not None
+                and 0.0 < terminal_growth_reference < 0.1
+                and float(terminal_growth_rate) < terminal_growth_reference
+            ):
+                terminal_growth_rate = terminal_growth_reference
+                data_sources.append(
+                    f"terminal_growth_rate: uplifted to extracted reference {terminal_growth_reference * 100:.2f}%"
+                )
+
+            risk_overlay = self._infer_public_company_risk_overlay(deal_industry, historical_ebitda_margins)
+
+            # Apply industry-aware terminal growth premium (e.g. IT services get +0.5%)
+            tgr_premium = risk_overlay.get("terminal_growth_premium", 0.0)
+            if tgr_premium > 0 and not params.get("terminal_growth_rate"):
+                terminal_growth_rate = float(terminal_growth_rate) + tgr_premium
+                data_sources.append(
+                    f"terminal_growth_rate: industry premium +{tgr_premium * 100:.1f}% applied "
+                    f"-> {terminal_growth_rate * 100:.2f}%"
+                )
+
+            risk_free_rate, _ = self._resolve("risk_free_rate", params, llm_data, generic_defaults, label="risk_free_rate")
             risk_free_rate = risk_free_rate if risk_free_rate else 0.07
 
-            erp, _ = self._resolve("equity_risk_premium", params, llm_data, GENERIC_DEFAULTS, label="equity_risk_premium")
-            erp = erp if erp else 0.06
+            equity_risk_premium, _ = self._resolve(
+                "equity_risk_premium",
+                params,
+                llm_data,
+                generic_defaults,
+                label="equity_risk_premium",
+            )
+            equity_risk_premium = equity_risk_premium if equity_risk_premium else (0.065 if is_private_company else 0.06)
 
-            beta, src = self._resolve("beta", params, llm_data, GENERIC_DEFAULTS, label="beta")
-            data_sources.append(src)
-            beta = beta if beta else 1.0
-
-            cost_of_debt, _ = self._resolve("cost_of_debt", params, llm_data, GENERIC_DEFAULTS, label="cost_of_debt")
+            cost_of_debt, _ = self._resolve("cost_of_debt", params, llm_data, generic_defaults, label="cost_of_debt")
             cost_of_debt = cost_of_debt if cost_of_debt else 0.09
 
             tax_rate = float(params.get("tax_rate") or 0.25)
 
-            debt_to_equity, src = self._resolve("debt_to_equity", params, llm_data, GENERIC_DEFAULTS, label="debt_to_equity")
-            data_sources.append(src)
+            debt_to_equity, source = self._resolve(
+                "debt_to_equity",
+                params,
+                llm_data,
+                generic_defaults,
+                label="debt_to_equity",
+            )
+            data_sources.append(source)
             debt_to_equity = debt_to_equity if debt_to_equity is not None else 0.0
 
             wacc_override = params.get("wacc_override")
-            wacc_breakdown = {}
             if wacc_override:
                 wacc = float(wacc_override)
                 wacc_breakdown = {"wacc": wacc, "note": "Manually overridden by user"}
             else:
                 temp_engine = DCFEngine(historical_revenues, historical_ebitda_margins, tax_rate=tax_rate)
-                wacc_breakdown = temp_engine.calculate_wacc_breakdown(
-                    risk_free_rate=risk_free_rate, equity_risk_premium=erp, beta=beta,
-                    cost_of_debt=cost_of_debt, debt_to_equity=debt_to_equity
-                )
+                if is_private_company:
+                    size_premium, source = self._resolve(
+                        "size_premium",
+                        params,
+                        llm_data,
+                        generic_defaults,
+                        label="size_premium",
+                    )
+                    data_sources.append(source)
+                    size_premium = size_premium if size_premium is not None else 0.03
+
+                    specific_risk_premium, source = self._resolve(
+                        "specific_risk_premium",
+                        params,
+                        llm_data,
+                        generic_defaults,
+                        label="specific_risk_premium",
+                    )
+                    data_sources.append(source)
+                    specific_risk_premium = specific_risk_premium if specific_risk_premium is not None else 0.04
+
+                    wacc_breakdown = temp_engine.calculate_private_company_wacc_breakdown(
+                        risk_free_rate=risk_free_rate,
+                        equity_risk_premium=equity_risk_premium,
+                        size_premium=size_premium,
+                        specific_risk_premium=specific_risk_premium,
+                        cost_of_debt=cost_of_debt,
+                        debt_to_equity=debt_to_equity,
+                    )
+                    discount_rate_reference = self._to_number(llm_data.get("discount_rate_reference"))
+                    if discount_rate_reference is not None and 0.12 <= discount_rate_reference <= 0.35:
+                        wacc_breakdown["reference_discount_rate"] = round(discount_rate_reference, 4)
+                        wacc_breakdown["reference_discount_rate_applied"] = True
+                        wacc_breakdown["wacc"] = round(discount_rate_reference, 4)
+                else:
+                    beta, source = self._resolve("beta", params, llm_data, generic_defaults, label="beta")
+                    data_sources.append(source)
+                    beta = beta if beta else 1.0
+                    base_beta = beta
+                    beta = max(beta, risk_overlay["beta_floor"])
+                    if beta != base_beta:
+                        overlay_reason = ", ".join(risk_overlay["reasons"]) or "public-company risk overlay"
+                        self.observe(
+                            f"Raised beta from {base_beta:.2f}x to {beta:.2f}x due to {overlay_reason}."
+                        )
+                        data_sources.append(f"beta: floored to {beta:.2f}x ({overlay_reason})")
+                    wacc_breakdown = temp_engine.calculate_wacc_breakdown(
+                        risk_free_rate=risk_free_rate,
+                        equity_risk_premium=equity_risk_premium,
+                        beta=beta,
+                        cost_of_debt=cost_of_debt,
+                        debt_to_equity=debt_to_equity,
+                        size_premium=risk_overlay["size_premium"],
+                        specific_risk_premium=risk_overlay["specific_risk_premium"],
+                    )
                 wacc = wacc_breakdown["wacc"]
 
-            currency = params.get("currency", llm_data.get("currency", GENERIC_DEFAULTS["currency"]))
+            currency = params.get("currency", llm_data.get("currency", generic_defaults["currency"]))
 
-            # Net Debt
-            net_debt, src = self._resolve("net_debt", params, llm_data, GENERIC_DEFAULTS, label="net_debt")
-            data_sources.append(src)
+            net_debt, source = self._resolve("net_debt", params, llm_data, generic_defaults, label="net_debt")
+            data_sources.append(source)
             net_debt = net_debt if net_debt is not None else 0
 
-            # Shares Outstanding
-            shares_outstanding, src = self._resolve("shares_outstanding", params, llm_data, GENERIC_DEFAULTS, label="shares_outstanding")
-            data_sources.append(src)
-            shares_outstanding = shares_outstanding if shares_outstanding else 100_000_000
+            shares_outstanding = None
+            shares_for_valuation = None
+            if not is_private_company:
+                shares_outstanding, source = self._resolve(
+                    "shares_outstanding",
+                    params,
+                    llm_data,
+                    generic_defaults,
+                    label="shares_outstanding",
+                )
+                data_sources.append(source)
 
-            # Engine operating parameters
-            da_pct, src = self._resolve("da_percent_rev", params, llm_data, GENERIC_DEFAULTS, label="da_percent_rev")
-            data_sources.append(src)
-            da_pct = da_pct if da_pct is not None else 0.056
+                diluted_shares = llm_data.get("diluted_shares_outstanding")
+                if diluted_shares is not None:
+                    pat = self._to_number(llm_data.get("profit_after_tax"))
+                    eps = self._to_number(llm_data.get("basic_eps"))
+                    diluted_shares = self._normalize_shares(diluted_shares, pat, eps, historical_revenues)
+                    if diluted_shares and (shares_outstanding is None or diluted_shares > shares_outstanding):
+                        shares_outstanding = diluted_shares
+                        data_sources.append("shares_outstanding: diluted shares used")
+                        self.observe(f"Using diluted shares ({diluted_shares:,.0f}) instead of basic shares.")
 
-            capex_pct, src = self._resolve("cap_ex_percent_rev", params, llm_data, GENERIC_DEFAULTS, label="cap_ex_percent_rev")
-            data_sources.append(src)
-            capex_pct = capex_pct if capex_pct is not None else 0.03
+                # EPS cross-check: if we have PAT & EPS, verify shares
+                pat = self._to_number(llm_data.get("profit_after_tax"))
+                eps = self._to_number(llm_data.get("basic_eps"))
+                if pat is not None and eps is not None and eps > 0:
+                    eps_implied_shares = pat / eps
+                    # If PAT is in crores but EPS is per-share, raw ratio is too small.
+                    # Try multiplying PAT by crore (1e7) and lakh (1e5) factors.
+                    candidates = [eps_implied_shares]
+                    if eps_implied_shares < 4_200_000:
+                        candidates.append(pat * 1e7 / eps)  # PAT was in Crores
+                        candidates.append(pat * 1e5 / eps)  # PAT was in Lakhs
+                    for cand in candidates:
+                        if 4_200_000 <= cand <= 10_000_000_000:
+                            eps_implied_shares = cand
+                            break
+                    if 4_200_000 <= eps_implied_shares <= 10_000_000_000:
+                        if shares_outstanding is None or abs(eps_implied_shares / shares_outstanding - 1) > 0.2:
+                            self.observe(
+                                f"EPS cross-check: PAT={pat:,.0f} / EPS={eps:.2f} implies "
+                                f"{eps_implied_shares:,.0f} shares (was {shares_outstanding:,.0f if shares_outstanding else 'None'})"
+                            )
+                            if shares_outstanding is None:
+                                shares_outstanding = eps_implied_shares
+                                data_sources.append("shares_outstanding: computed from PAT/EPS")
 
-            revenue_cagr_override, src = self._resolve(
-                "revenue_cagr_override", params, llm_data, GENERIC_DEFAULTS, label="revenue_cagr_override"
+                shares_verified = bool(params.get("shares_outstanding")) or self._field_has_strong_support(
+                    "shares_outstanding",
+                    extraction_audit_trail,
+                ) or self._field_has_strong_support(
+                    "diluted_shares_outstanding",
+                    extraction_audit_trail,
+                )
+
+                # For calibrated fallback profiles (non-generic), trust shares at reduced confidence
+                is_calibrated_fallback = fallback_mode and fallback_profile and "generic" not in fallback_profile
+                if not shares_verified and is_calibrated_fallback and shares_outstanding is not None:
+                    shares_verified = True
+                    data_sources.append("shares_outstanding: from fallback profile (reduced confidence)")
+
+                if shares_outstanding is not None and shares_verified:
+                    shares_for_valuation = float(shares_outstanding)
+                else:
+                    shares_outstanding = None
+                    data_sources.append("shares_outstanding: unverified; per-share valuation suppressed")
+            else:
+                extracted_shares = llm_data.get("shares_outstanding")
+                if extracted_shares is not None:
+                    self.observe(
+                        "Private company detected; suppressing per-share valuation even though share count was extracted."
+                    )
+
+            da_percent_rev, source = self._resolve("da_percent_rev", params, llm_data, generic_defaults, label="da_percent_rev")
+            data_sources.append(source)
+            da_percent_rev = da_percent_rev if da_percent_rev is not None else 0.056
+
+            cap_ex_percent_rev, source = self._resolve(
+                "cap_ex_percent_rev",
+                params,
+                llm_data,
+                generic_defaults,
+                label="cap_ex_percent_rev",
             )
-            data_sources.append(src)
+            data_sources.append(source)
+            cap_ex_percent_rev = cap_ex_percent_rev if cap_ex_percent_rev is not None else 0.03
+
+            revenue_cagr_override, source = self._resolve(
+                "revenue_cagr_override",
+                params,
+                llm_data,
+                generic_defaults,
+                label="revenue_cagr_override",
+            )
+            data_sources.append(source)
+
+            growth_low = self._to_number(llm_data.get("forecast_revenue_growth_low"))
+            growth_high = self._to_number(llm_data.get("forecast_revenue_growth_high"))
+            if revenue_cagr_override is None and growth_low is not None and growth_high is not None:
+                if 0 < growth_low < 0.5 and 0 < growth_high < 0.5 and growth_high >= growth_low:
+                    revenue_cagr_override = (growth_low + growth_high) / 2.0
+                    data_sources.append(
+                        "revenue_cagr_override: midpoint of extracted growth range "
+                        f"({growth_low * 100:.1f}% to {growth_high * 100:.1f}%)"
+                    )
+
             if revenue_cagr_override is not None:
                 revenue_cagr_override = self._normalize_pct_field(revenue_cagr_override, "revenue_cagr_override")
+            if revenue_cagr_override is None and params.get("revenue_cagr_override_auto") is not None:
+                revenue_cagr_override = params["revenue_cagr_override_auto"]
+                data_sources.append(f"revenue_cagr_override: auto-capped to {revenue_cagr_override * 100:.1f}%")
 
-            nwc_pct = float(params.get("nwc_percent_rev") or 0.10)
+            nwc_percent_rev = float(params.get("nwc_percent_rev") or 0.10)
 
-            base_fy, src = self._resolve("base_fy", params, llm_data, GENERIC_DEFAULTS, cast=int, label="base_fy")
-            data_sources.append(src)
+            base_fy, source = self._resolve("base_fy", params, llm_data, generic_defaults, cast=int, label="base_fy")
+            data_sources.append(source)
             base_fy = base_fy if base_fy else 2025
 
             dso = float(params.get("dso") or 45.0)
             dpo = float(params.get("dpo") or 30.0)
             dio = float(params.get("dio") or 30.0)
 
-            # EBITDA margin override from frontend
-            ebitda_override = params.get("ebitda_margin_override")
-            if ebitda_override:
-                margin_val = float(ebitda_override)
-                if margin_val > 1.0:
-                    margin_val = margin_val / 100.0  # User entered percentage
-                historical_ebitda_margins = [margin_val] * len(historical_ebitda_margins)
+            ebitda_margin_override = params.get("ebitda_margin_override")
+            if ebitda_margin_override:
+                margin_value = float(ebitda_margin_override)
+                if margin_value > 1.0:
+                    margin_value = margin_value / 100.0
+                historical_ebitda_margins = [margin_value] * len(historical_ebitda_margins)
 
-            # Loss-making check
             avg_margin = sum(historical_ebitda_margins) / len(historical_ebitda_margins)
-            is_loss_making = avg_margin < 0
+            latest_margin = historical_ebitda_margins[-1]
+            is_loss_making = avg_margin < 0 or latest_margin < 0
             if is_loss_making:
-                self.observe(f"WARNING: NEGATIVE EBITDA margin ({avg_margin*100:.1f}%).")
+                self.observe(f"Warning: negative average EBITDA margin ({avg_margin * 100:.1f}%).")
 
-            # Log data sources
             self.observe(f"Data source audit: {'; '.join(data_sources)}")
+
+            total_borrowings = llm_data.get("total_borrowings", generic_defaults["total_borrowings"])
+            ccps_liability = llm_data.get("ccps_liability", generic_defaults["ccps_liability"])
+            lease_liabilities = llm_data.get("lease_liabilities", generic_defaults["lease_liabilities"])
+            cash_and_equivalents = llm_data.get("cash_and_equivalents", generic_defaults["cash_and_equivalents"])
+
+            if isinstance(total_borrowings, str):
+                total_borrowings = float(total_borrowings)
+            if isinstance(ccps_liability, str):
+                ccps_liability = float(ccps_liability)
+            if isinstance(lease_liabilities, str):
+                lease_liabilities = float(lease_liabilities)
+            if isinstance(cash_and_equivalents, str):
+                cash_and_equivalents = float(cash_and_equivalents)
+
+            total_debt_for_bridge = (total_borrowings or 0) + (lease_liabilities or 0) + (ccps_liability or 0)
+
+            if (
+                self._to_number(llm_data.get("total_borrowings")) is not None
+                and self._to_number(llm_data.get("cash_and_equivalents")) is not None
+            ):
+                net_debt = total_debt_for_bridge - (cash_and_equivalents or 0)
+                data_sources.append("net_debt: recomputed from borrowings + lease + CCPS - cash")
+
+            projection_years = int(params.get("projection_years") or 5)
+
+            # Industry-aware minimum projection years
+            industry_min_years = risk_overlay.get("min_projection_years", 5)
+            if projection_years < industry_min_years and not params.get("projection_years"):
+                self.observe(
+                    f"Industry overlay requires {industry_min_years}+ year forecast; "
+                    f"extending from {projection_years} to {industry_min_years} years."
+                )
+                projection_years = industry_min_years
+                data_sources.append(
+                    f"projection_years: auto-extended to {industry_min_years} for "
+                    + (", ".join(risk_overlay.get("reasons", [])) or "industry profile")
+                )
+
+            if is_loss_making and projection_years < 7:
+                self.observe(
+                    f"Loss-making profile detected; extending explicit forecast period from {projection_years} to 7 years."
+                )
+                projection_years = 7
+                data_sources.append("projection_years: auto-extended to 7 for turnaround profile")
+
+            tax_loss_carryforward = float(
+                params.get("tax_loss_carryforward")
+                or self._estimate_tax_loss_carryforward(
+                    historical_revenues,
+                    historical_ebitda_margins,
+                    da_percent_rev,
+                )
+            )
 
             engine = DCFEngine(
                 historical_revenues=historical_revenues,
                 historical_ebitda_margins=historical_ebitda_margins,
                 tax_rate=tax_rate,
-                da_percent_rev=da_pct,
-                cap_ex_percent_rev=capex_pct,
+                da_percent_rev=da_percent_rev,
+                cap_ex_percent_rev=cap_ex_percent_rev,
                 revenue_cagr_override=revenue_cagr_override,
-                nwc_percent_rev=nwc_pct,
+                nwc_percent_rev=nwc_percent_rev,
                 base_fy=base_fy,
-                dso=dso, dpo=dpo, dio=dio,
-                total_debt=llm_data.get("total_borrowings", GENERIC_DEFAULTS["total_borrowings"]),
-                cash_and_equivalents=llm_data.get("cash_and_equivalents", GENERIC_DEFAULTS["cash_and_equivalents"])
+                tax_loss_carryforward=tax_loss_carryforward,
+                dso=dso,
+                dpo=dpo,
+                dio=dio,
+                total_debt=total_debt_for_bridge,
+                cash_and_equivalents=cash_and_equivalents,
             )
 
-            projections_data = engine.build_projections(projection_years=7, terminal_growth_rate=tgr)
-
+            projections_data = engine.build_projections(
+                projection_years=projection_years,
+                terminal_growth_rate=terminal_growth_rate,
+            )
             valuation_data = engine.calculate_valuation(
                 ufcf_projections=projections_data["projections"]["ufcf"],
                 wacc=wacc,
-                terminal_growth_rate=tgr,
+                terminal_growth_rate=terminal_growth_rate,
                 net_debt=net_debt,
-                shares_outstanding=shares_outstanding
+                shares_outstanding=shares_for_valuation,
             )
             self.observe("DCF computed successfully.")
 
-            # ─── Advanced Analysis ─────────────────────────
+            private_adjustment_factor = 1.0
+            liquidity_discount = 0.0
+            control_premium = 0.0
+            valuation_basis = "share_price" if shares_for_valuation is not None else "equity_value"
+            if is_private_company:
+                liquidity_discount, source = self._resolve(
+                    "liquidity_discount",
+                    params,
+                    llm_data,
+                    generic_defaults,
+                    label="liquidity_discount",
+                )
+                data_sources.append(source)
+                liquidity_discount = liquidity_discount if liquidity_discount is not None else 0.25
+
+                control_premium, source = self._resolve(
+                    "control_premium",
+                    params,
+                    llm_data,
+                    generic_defaults,
+                    label="control_premium",
+                )
+                data_sources.append(source)
+                control_premium = control_premium if control_premium is not None else 0.0
+
+                private_adjustment_factor = (1 - liquidity_discount) * (1 + control_premium)
+                raw_equity_value = valuation_data["implied_equity_value"]
+                valuation_data["pre_private_adjustment_equity_value"] = raw_equity_value
+                valuation_data["liquidity_discount"] = liquidity_discount
+                valuation_data["control_premium"] = control_premium
+                valuation_data["implied_equity_value"] = round(raw_equity_value * private_adjustment_factor, 2)
+                valuation_data["implied_share_price"] = None
+                valuation_basis = "equity_value"
+
             ufcf = projections_data["projections"]["ufcf"]
-            net_debt_float = float(net_debt) if isinstance(net_debt, str) else net_debt
-            shares_float = float(shares_outstanding) if isinstance(shares_outstanding, str) else shares_outstanding
+            scenario_data = engine.build_full_scenario_analysis(
+                wacc,
+                terminal_growth_rate,
+                float(net_debt),
+                shares_for_valuation,
+                projection_years=projection_years,
+            )
+            exit_multiple = float(params.get("exit_multiple") or risk_overlay["terminal_exit_multiple"])
+            terminal_ebitda = projections_data["projections"]["ebitda"][-1] if projections_data["projections"]["ebitda"] else None
+            tv_crosscheck = engine.terminal_value_crosscheck(
+                ufcf,
+                terminal_ebitda,
+                wacc,
+                terminal_growth_rate,
+                exit_multiple=exit_multiple,
+            )
 
-            scenario_data = engine.build_full_scenario_analysis(wacc, tgr, net_debt_float, shares_float)
-            tv_crosscheck = engine.terminal_value_crosscheck(ufcf, wacc, tgr, exit_multiple=12.0)
+            if is_private_company:
+                for scenario in scenario_data.values():
+                    raw_equity_value = scenario["valuation"]["equity_value"]
+                    scenario["valuation"]["pre_private_adjustment_equity_value"] = raw_equity_value
+                    scenario["valuation"]["equity_value"] = round(raw_equity_value * private_adjustment_factor, 2)
+                    scenario["valuation"]["share_price"] = None
 
-            total_rev = sum(projections_data["projections"]["revenue"])
+            total_projected_revenue = sum(projections_data["projections"]["revenue"])
             sbc_data = engine.calculate_sbc_adjusted(
-                valuation_data["implied_equity_value"], shares_outstanding,
-                sbc_pct_rev=0.01, total_projected_revenue=total_rev
+                valuation_data["implied_equity_value"],
+                shares_for_valuation,
+                sbc_pct_rev=0.01,
+                total_projected_revenue=total_projected_revenue,
             )
 
-            margin_sens = engine.calculate_margin_sensitivity(
+            margin_sensitivity = engine.calculate_margin_sensitivity(
                 projections_data["projections"]["revenue"],
-                wacc, tgr, net_debt_float, shares_float,
-                base_margin=projections_data["assumptions"]["avg_ebitda_margin"]
+                wacc,
+                terminal_growth_rate,
+                float(net_debt),
+                shares_for_valuation,
+                base_margin=projections_data["assumptions"]["avg_ebitda_margin"],
             )
 
-            capex_pct_float = float(capex_pct) if isinstance(capex_pct, str) else capex_pct
-            capex_sens = engine.calculate_capex_sensitivity(
-                ufcf, projections_data["projections"]["revenue"],
-                wacc, tgr, net_debt_float, shares_float, capex_pct_float
+            capex_sensitivity = engine.calculate_capex_sensitivity(
+                ufcf,
+                projections_data["projections"]["revenue"],
+                wacc,
+                terminal_growth_rate,
+                float(net_debt),
+                shares_for_valuation,
+                float(cap_ex_percent_rev),
             )
 
-            sensitivity = engine.build_sensitivity_matrix(ufcf, wacc, tgr, net_debt_float, shares_float)
+            sensitivity = engine.build_sensitivity_matrix(
+                ufcf,
+                wacc,
+                terminal_growth_rate,
+                float(net_debt),
+                shares_for_valuation,
+                metric="share_price" if valuation_basis == "share_price" else "equity_value",
+                adjustment_factor=private_adjustment_factor,
+            )
 
-            # ─── Equity Bridge ─────────────────────────────
-            total_borrowings = llm_data.get("total_borrowings")
-            if total_borrowings is None:
-                total_borrowings = GENERIC_DEFAULTS["total_borrowings"]
+            def safe_round(value):
+                return round(float(value), 2) if value is not None else None
 
-            cash_and_equiv = llm_data.get("cash_and_equivalents")
-            if cash_and_equiv is None:
-                cash_and_equiv = GENERIC_DEFAULTS["cash_and_equivalents"]
+            if is_private_company:
+                ev_bridge = {
+                    "enterprise_value": safe_round(valuation_data.get("implied_enterprise_value")),
+                    "less_total_debt": safe_round(total_debt_for_bridge),
+                    "ccps_liability": safe_round(ccps_liability),
+                    "lease_liabilities": safe_round(lease_liabilities),
+                    "add_cash": safe_round(cash_and_equivalents),
+                    "net_debt": safe_round(net_debt),
+                    "pre_private_adjustment_equity_value": safe_round(valuation_data.get("pre_private_adjustment_equity_value")),
+                    "liquidity_discount_percent": liquidity_discount,
+                    "control_premium_percent": control_premium,
+                    "equity_value": safe_round(valuation_data.get("implied_equity_value")),
+                }
+            else:
+                ev_bridge = {
+                    "enterprise_value": safe_round(valuation_data.get("implied_enterprise_value")),
+                    "less_total_debt": safe_round(total_debt_for_bridge),
+                    "ccps_liability": safe_round(ccps_liability),
+                    "lease_liabilities": safe_round(lease_liabilities),
+                    "add_cash": safe_round(cash_and_equivalents),
+                    "net_debt": safe_round(net_debt),
+                    "is_net_cash": float(net_debt) < 0 if net_debt is not None else False,
+                    "equity_value": safe_round(valuation_data.get("implied_equity_value")),
+                    "shares_outstanding": shares_outstanding,
+                    "implied_price_per_share": safe_round(valuation_data.get("implied_share_price")),
+                }
 
-            if isinstance(total_borrowings, str):
-                total_borrowings = float(total_borrowings)
-            if isinstance(cash_and_equiv, str):
-                cash_and_equiv = float(cash_and_equiv)
-
-            net_debt_float = float(net_debt) if isinstance(net_debt, str) else net_debt
-
-            if total_borrowings == 0 and cash_and_equiv == 0 and net_debt_float != 0:
-                if net_debt_float > 0:
-                    total_borrowings = net_debt_float
-                    cash_and_equiv = 0
-                else:
-                    total_borrowings = 0
-                    cash_and_equiv = abs(net_debt_float)
-
-            def safe_round(val):
-                return round(float(val), 2) if val is not None else 0.0
-
-            ev_bridge = {
-                "enterprise_value": safe_round(valuation_data.get("implied_enterprise_value")),
-                "less_total_debt": safe_round(total_borrowings),
-                "add_cash": safe_round(cash_and_equiv),
-                "net_debt": safe_round(net_debt_float),
-                "is_net_cash": net_debt_float < 0 if net_debt_float is not None else False,
-                "equity_value": safe_round(valuation_data.get("implied_equity_value")),
-                "shares_outstanding": shares_outstanding,
-                "implied_price_per_share": safe_round(valuation_data.get("implied_share_price")),
-            }
-
-            # ─── Extraction Quality ───────────────────────
             docs = store.get_documents_for_deal(self.deal_id)
             if llm_data and fallback_mode:
                 data_source_mode = "Deterministic Fallback"
+            elif llm_data and extraction_mode == "legacy_llm":
+                data_source_mode = "Legacy LLM Extraction"
             elif llm_data:
-                data_source_mode = "LLM Extraction"
+                data_source_mode = "Maker-Checker Pipeline"
             else:
                 data_source_mode = "Generic Defaults"
+
+            audit_trail_summary = [
+                {
+                    "field": record.field_name,
+                    "confidence": record.confidence_score,
+                    "source": record.source_citation,
+                    "auditor_status": record.auditor_status,
+                    "triangulation": record.triangulation_status,
+                }
+                for record in audit_records
+            ]
+
             extraction_quality = {
                 "mode": data_source_mode,
                 "source_type": docs[0].file_type.upper() if docs else "N/A",
@@ -600,23 +1400,52 @@ class FinancialModelingAgent(BaseAgent):
                 "missing_fields": "none" if llm_data else "all (using generic fallbacks)",
                 "is_loss_making": is_loss_making,
                 "data_sources": data_sources,
+                "pipeline_stages": ["Preparer", "Auditor", "Triangulator"],
+                "audit_trail": audit_trail_summary,
+                "triangulation": triangulation_result,
+                "company_classification": company_context,
+                "key_field_status": {
+                    "shares_verified": shares_for_valuation is not None,
+                    "per_share_value_available": shares_for_valuation is not None and not is_private_company,
+                    "tax_loss_carryforward_modeled": tax_loss_carryforward > 0,
+                },
             }
 
-            # ─── Bundle Result ─────────────────────────────
-            deal = store.get_deal(self.deal_id)
-            deal_name = deal.name if deal else "Unknown_Deal"
-
-            warnings = valuation_data.get("warnings", [])
+            warnings = list(valuation_data.get("warnings", []))
             if is_loss_making:
-                warnings.append(f"NEGATIVE EBITDA MARGIN ({avg_margin*100:.1f}%): Company is loss-making.")
-            if llm_data and fallback_mode:
+                warnings.append(f"NEGATIVE EBITDA MARGIN ({avg_margin * 100:.1f}%): company is loss-making.")
+            if fallback_mode:
                 warnings.append(
-                    "DETERMINISTIC FALLBACK USED: API extraction was unavailable, so a predefined "
-                    f"profile ({fallback_profile or 'default'}) was applied."
+                    "DETERMINISTIC FALLBACK USED: the model relied on a predefined extraction profile "
+                    f"({fallback_profile or 'default'})."
+                )
+            if auditor_status in {"flagged", "rejected"}:
+                warnings.append(f"AUDITOR STATUS: {auditor_status.upper()}. Review extracted facts before relying on the valuation.")
+            if triangulation_result.get("overall_verdict") == "halt":
+                warnings.append("TRIANGULATION FAILED: fundamental accounting identities did not reconcile.")
+            elif triangulation_result.get("overall_verdict") == "warning":
+                warnings.append("TRIANGULATION WARNING: some extracted facts did not fully reconcile.")
+            if is_private_company:
+                warnings.append(
+                    "PRIVATE COMPANY DETECTED: per-share valuation suppressed; using build-up cost of equity "
+                    "and applying illiquidity adjustments."
+                )
+            if not is_private_company and shares_for_valuation is None:
+                warnings.append(
+                    "PER-SHARE VALUATION SUPPRESSED: shares outstanding could not be verified from the extraction trail."
+                )
+            if risk_overlay["reasons"] and not is_private_company:
+                warnings.append(
+                    "PUBLIC RISK OVERLAY APPLIED: "
+                    + "; ".join(risk_overlay["reasons"])
+                    + "."
+                )
+            if tax_loss_carryforward > 0:
+                warnings.append(
+                    f"TAX LOSS CARRYFORWARD MODELED: opening NOL estimated at {tax_loss_carryforward:,.0f}."
                 )
             if not llm_data:
-                warnings.append("LLM EXTRACTION FAILED: Using generic fallback values. "
-                              "Results will NOT reflect the uploaded company's actual financials.")
+                warnings.append("EXTRACTION FAILED: using generic fallback values. Results do not reflect the uploaded company's actual financials.")
 
             valuation_result = {
                 "header": {
@@ -626,6 +1455,14 @@ class FinancialModelingAgent(BaseAgent):
                     "wacc": wacc,
                     "wacc_breakdown": wacc_breakdown,
                     "terminal_method": "Gordon",
+                    "currency": currency,
+                    "valuation_basis": valuation_basis,
+                    "is_private_company": is_private_company,
+                    "company_type": company_context["entity_type"],
+                    "liquidity_discount": liquidity_discount if is_private_company else None,
+                    "control_premium": control_premium if is_private_company else None,
+                    "projection_horizon_years": projection_years,
+                    "per_share_value_available": shares_for_valuation is not None and not is_private_company,
                 },
                 "currency": currency,
                 "historical": projections_data.get("historical", {}),
@@ -634,16 +1471,21 @@ class FinancialModelingAgent(BaseAgent):
                 "ev_bridge": ev_bridge,
                 "tv_crosscheck": tv_crosscheck,
                 "sbc_adjusted": sbc_data,
-                "margin_sensitivity": margin_sens,
-                "capex_sensitivity": capex_sens,
-                "sensitivity": sensitivity,
+                "margin_sensitivity": margin_sensitivity,
+                "capex_sensitivity": capex_sensitivity,
+                "sensitivity_wacc_tgr": sensitivity.get("matrix", []),
+                "sensitivity_labels": {
+                    "wacc": sensitivity.get("wacc_headers", []),
+                    "tgr": sensitivity.get("tgr_headers", []),
+                    "metric": sensitivity.get("metric", valuation_basis),
+                },
                 "extraction_quality": extraction_quality,
+                "company_classification": company_context,
                 "assumptions": projections_data["assumptions"],
                 "uploaded_company": deal_name,
                 "warnings": warnings,
             }
 
-            # ─── Excel Output ─────────────────────────────
             self.think("Generating professional Excel output artifact.")
             self.act("excel_writer", "Writing projections and valuation into DCF template")
 
@@ -652,24 +1494,32 @@ class FinancialModelingAgent(BaseAgent):
                     deal_name=deal_name,
                     assumptions=projections_data["assumptions"],
                     projections=projections_data["projections"],
-                    valuation={**valuation_data, "total_borrowings": total_borrowings, "wacc_breakdown": wacc_breakdown},
+                    valuation={
+                        **valuation_data,
+                        "total_borrowings": total_borrowings,
+                        "ccps_liability": ccps_liability,
+                        "lease_liabilities": lease_liabilities,
+                        "wacc_breakdown": wacc_breakdown,
+                        "valuation_basis": valuation_basis,
+                        "is_private_company": is_private_company,
+                        "liquidity_discount": liquidity_discount if is_private_company else 0.0,
+                        "control_premium": control_premium if is_private_company else 0.0,
+                    },
                     currency=currency,
-                    historical=projections_data.get("historical")
+                    historical=projections_data.get("historical"),
                 )
                 self.observe(f"Workbook correctly saved to {filepath}")
-            except Exception as e:
-                import traceback
-                self.fail(f"Excel generation failed: {str(e)}\n{traceback.format_exc()}")
+            except Exception as exc:
+                self.fail(f"Excel generation failed: {exc}")
                 return self.run_id
 
-            # Register output
             new_output = Output(
                 deal_id=self.deal_id,
                 agent_run_id=self.run_id,
                 filename=os.path.basename(filepath),
                 output_type="xlsx",
                 output_category="financial_model",
-                storage_path=filepath
+                storage_path=filepath,
             )
             store.outputs[new_output.id] = new_output
 
@@ -677,9 +1527,8 @@ class FinancialModelingAgent(BaseAgent):
             if run_record:
                 run_record.input_payload["valuation_result"] = valuation_result
 
-            self.complete(confidence=0.95)
-
-        except Exception as e:
-            self.fail(f"Computation or formatting failed: {str(e)}")
+            self.complete(confidence=0.95 if llm_data else 0.6)
+        except Exception as exc:
+            self.fail(f"Computation or formatting failed: {exc}")
 
         return self.run_id
