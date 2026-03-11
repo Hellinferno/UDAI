@@ -2,6 +2,7 @@ from typing import Dict, Any, Optional, Tuple
 import json
 import re
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 from agents.base import BaseAgent
 from agents.prompt_builder import PromptBuilder
@@ -10,6 +11,8 @@ from agents.auditor import AuditorAgent
 from engine.dcf import DCFEngine
 from engine.llm import ask_llm
 from engine.triangulator import Triangulator
+from engine.comps import ComparableAnalysisEngine
+from engine.financial_statement_analyzer import FinancialStatementAnalyzer
 from tools.excel_writer import WorkbookBuilder
 from store import store, Output, ExtractionAudit
 
@@ -571,6 +574,93 @@ class FinancialModelingAgent(BaseAgent):
             "evidence": evidence,
         }
 
+    @staticmethod
+    def _summarize_preparer_quality(audit_trail: list, extracted_data: dict) -> dict:
+        confidences = [
+            float(entry.get("confidence") or 0.0)
+            for entry in (audit_trail or [])
+            if isinstance(entry, dict)
+        ]
+        avg_conf = (sum(confidences) / len(confidences)) if confidences else 0.0
+
+        required_fields = [
+            "historical_revenues",
+            "historical_ebitda_margins",
+            "net_debt",
+            "cash_and_equivalents",
+            "total_borrowings",
+        ]
+        present_required = sum(
+            1
+            for field in required_fields
+            if extracted_data.get(field) is not None
+        )
+        coverage = present_required / len(required_fields)
+
+        low_fields = [
+            entry.get("field")
+            for entry in (audit_trail or [])
+            if float(entry.get("confidence") or 0.0) < 0.65
+        ]
+
+        # Weighted quality score for evaluator stage.
+        quality_score = round((avg_conf * 0.7) + (coverage * 0.3), 4)
+        return {
+            "quality_score": quality_score,
+            "avg_confidence": round(avg_conf, 4),
+            "required_coverage": round(coverage, 4),
+            "low_confidence_fields": [field for field in low_fields if field],
+        }
+
+    @staticmethod
+    def _build_retry_guidance(quality_summary: dict, attempt: int) -> str:
+        low_fields = quality_summary.get("low_confidence_fields", [])
+        low_fields_text = ", ".join(low_fields[:8]) if low_fields else "key financial fields"
+        return (
+            "\n\nRETRY_GUIDANCE:\n"
+            f"This is extraction retry attempt {attempt}.\n"
+            "Focus only on audited annual-report figures, not assumptions.\n"
+            f"Prioritize verification for: {low_fields_text}.\n"
+            "If a value is not found with citation, return null and explain briefly in reconciliation_log.\n"
+            "Do not fabricate values.\n"
+        )
+
+    @staticmethod
+    def _build_synthesis_summary(
+        dcf_header: dict,
+        comps_snapshot: dict,
+        scenario_data: dict,
+    ) -> str:
+        dcf_ev = dcf_header.get("enterprise_value")
+        dcf_eq = dcf_header.get("equity_value")
+        dcf_px = dcf_header.get("implied_share_price")
+        comps_base = comps_snapshot.get("scenarios", {}).get("base", {})
+        comps_eq = comps_base.get("equity_value")
+        comps_px = comps_base.get("implied_share_price")
+
+        base = scenario_data.get("base", {}).get("valuation", {})
+        bear = scenario_data.get("bear", {}).get("valuation", {})
+        bull = scenario_data.get("bull", {}).get("valuation", {})
+        base_metric = base.get("share_price") if base.get("share_price") is not None else base.get("equity_value")
+        bear_metric = bear.get("share_price") if bear.get("share_price") is not None else bear.get("equity_value")
+        bull_metric = bull.get("share_price") if bull.get("share_price") is not None else bull.get("equity_value")
+
+        return (
+            "Parallel synthesis complete. "
+            f"DCF implies EV={dcf_ev:,.0f} and Equity={dcf_eq:,.0f}" if isinstance(dcf_ev, (int, float)) and isinstance(dcf_eq, (int, float))
+            else "Parallel synthesis complete. DCF output available."
+        ) + (
+            f"; implied price={dcf_px:,.2f}" if isinstance(dcf_px, (int, float)) else ""
+        ) + (
+            f". Comps base equity={comps_eq:,.0f}" if isinstance(comps_eq, (int, float)) else "."
+        ) + (
+            f"; comps implied price={comps_px:,.2f}" if isinstance(comps_px, (int, float)) else ""
+        ) + (
+            f". Scenario range: bear={bear_metric:,.2f}, base={base_metric:,.2f}, bull={bull_metric:,.2f}."
+            if all(isinstance(x, (int, float)) for x in [bear_metric, base_metric, bull_metric])
+            else ""
+        )
+
     # ------------------------------------------------------------------
     # Main Agent Logic
     # ------------------------------------------------------------------
@@ -636,25 +726,66 @@ class FinancialModelingAgent(BaseAgent):
         preparer_output = {}
         auditor_status = "skipped"
 
-        self.think("[Stage 1/3] Running preparer extraction with reconciliation prompting.")
-        self.act("preparer_agent", "Extracting financial data with citations and confidence scores")
-        try:
-            preparer_output = PreparerAgent.extract(
-                system_prompt=self.system_prompt,
-                document_context=full_context,
-                params=params,
-                company_name=company_name,
-            )
-            llm_data = preparer_output.get("extracted_data", {})
-            extraction_audit_trail = preparer_output.get("audit_trail", [])
-            extraction_mode = preparer_output.get("extraction_mode", "llm")
+        max_extraction_retries = max(1, int(params.get("extraction_retry_limit") or 2))
+        quality_threshold = float(params.get("extraction_quality_threshold") or 0.70)
+        best_quality_score = -1.0
+        best_payload = None
+        current_context = full_context
+        self.think("[Stage 1/3] Running preparer extraction with evaluator-optimizer retries.")
+
+        for attempt in range(1, max_extraction_retries + 1):
+            self.act("preparer_agent", f"Attempt {attempt}: extracting with citations and confidence scores")
+            try:
+                attempt_output = PreparerAgent.extract(
+                    system_prompt=self.system_prompt,
+                    document_context=current_context,
+                    params=params,
+                    company_name=company_name,
+                )
+                attempt_data = attempt_output.get("extracted_data", {})
+                attempt_audit = attempt_output.get("audit_trail", [])
+                attempt_mode = attempt_output.get("extraction_mode", "llm")
+
+                quality = self._summarize_preparer_quality(attempt_audit, attempt_data)
+                quality_score = quality["quality_score"]
+
+                self.observe(
+                    f"Preparer attempt {attempt}: fields={len(attempt_data)}, "
+                    f"audit={len(attempt_audit)}, quality={quality_score:.2f}."
+                )
+
+                if quality_score > best_quality_score:
+                    best_quality_score = quality_score
+                    best_payload = {
+                        "preparer_output": attempt_output,
+                        "llm_data": attempt_data,
+                        "audit_trail": attempt_audit,
+                        "extraction_mode": attempt_mode,
+                        "quality": quality,
+                    }
+
+                is_fallback_attempt = str(attempt_mode).lower() == "deterministic_fallback"
+                if quality_score >= quality_threshold or is_fallback_attempt:
+                    break
+
+                if has_uploaded_documents:
+                    retry_guidance = self._build_retry_guidance(quality, attempt + 1)
+                    current_context = full_context + retry_guidance
+            except Exception as exc:
+                self.observe(f"Preparer attempt {attempt} failed ({exc}).")
+
+        if best_payload:
+            preparer_output = best_payload["preparer_output"]
+            llm_data = best_payload["llm_data"]
+            extraction_audit_trail = best_payload["audit_trail"]
+            extraction_mode = best_payload["extraction_mode"]
             fallback_mode = str(extraction_mode).lower() == "deterministic_fallback"
             fallback_profile = str(llm_data.get("fallback_profile", ""))
             self.observe(
-                f"Preparer extracted {len(llm_data)} fields with {len(extraction_audit_trail)} audit entries."
+                f"Selected extraction payload with quality={best_payload['quality']['quality_score']:.2f} "
+                f"(threshold={quality_threshold:.2f})."
             )
-        except Exception as exc:
-            self.observe(f"Preparer extraction failed ({exc}).")
+        else:
             llm_data = {}
 
         if not llm_data:
@@ -1281,13 +1412,138 @@ class FinancialModelingAgent(BaseAgent):
                 valuation_basis = "equity_value"
 
             ufcf = projections_data["projections"]["ufcf"]
-            scenario_data = engine.build_full_scenario_analysis(
-                wacc,
-                terminal_growth_rate,
-                float(net_debt),
-                shares_for_valuation,
-                projection_years=projection_years,
+            comps_engine = ComparableAnalysisEngine()
+            latest_revenue_for_comps = historical_revenues[-1] if historical_revenues else 0.0
+            avg_margin_for_comps = (
+                sum(historical_ebitda_margins) / len(historical_ebitda_margins)
+                if historical_ebitda_margins
+                else 0.10
             )
+
+            statement_analyzer = FinancialStatementAnalyzer()
+            statement_payload = {
+                "revenue": latest_revenue_for_comps,
+                "ebitda": latest_revenue_for_comps * avg_margin_for_comps,
+                "ebit": latest_revenue_for_comps * max(avg_margin_for_comps - float(da_percent_rev or 0.0), 0.0),
+                "net_income": float(llm_data.get("profit_after_tax") or 0.0),
+                "current_assets": float(llm_data.get("cash_and_equivalents") or 0.0) + (latest_revenue_for_comps * 0.22),
+                "current_liabilities": max(latest_revenue_for_comps * 0.15, 1.0),
+                "inventory": latest_revenue_for_comps * 0.04,
+                "cash_and_equivalents": float(llm_data.get("cash_and_equivalents") or 0.0),
+                "total_debt": float(total_debt_for_bridge or 0.0),
+                "shareholders_equity": max((latest_revenue_for_comps * 0.45), 1.0),
+                "total_assets": max((latest_revenue_for_comps * 1.25), 1.0),
+                "interest_expense": max(float(total_debt_for_bridge or 0.0) * 0.09, 1.0),
+                "accounts_receivable": max(latest_revenue_for_comps * 0.18, 1.0),
+            }
+
+            historical_periods = []
+            if historical_revenues and historical_ebitda_margins:
+                history_pairs = list(zip(historical_revenues, historical_ebitda_margins))
+                for revenue_hist, margin_hist in history_pairs[-5:]:
+                    rev = float(revenue_hist or 0.0)
+                    margin = float(margin_hist or 0.0)
+                    ebitda_hist = rev * margin
+                    ebit_hist = rev * max(margin - float(da_percent_rev or 0.0), 0.0)
+                    historical_periods.append({
+                        "revenue": rev,
+                        "ebitda": ebitda_hist,
+                        "ebit": ebit_hist,
+                        "net_income": ebit_hist * (1.0 - float(tax_rate or 0.0)),
+                        "current_assets": float(llm_data.get("cash_and_equivalents") or 0.0) + (rev * 0.22),
+                        "current_liabilities": max(rev * 0.15, 1.0),
+                        "inventory": rev * 0.04,
+                        "cash_and_equivalents": float(llm_data.get("cash_and_equivalents") or 0.0),
+                        "total_debt": float(total_debt_for_bridge or 0.0),
+                        "shareholders_equity": max((rev * 0.45), 1.0),
+                        "total_assets": max((rev * 1.25), 1.0),
+                        "interest_expense": max(float(total_debt_for_bridge or 0.0) * 0.09, 1.0),
+                        "accounts_receivable": max(rev * 0.18, 1.0),
+                    })
+
+            if historical_periods:
+                statement_payload["historical_periods"] = historical_periods
+
+            mc_iterations = int(params.get("monte_carlo_iterations") or 1500)
+            mc_var_confidence = float(params.get("monte_carlo_var_confidence_level") or 0.95)
+            mc_correlation_matrix = params.get("monte_carlo_correlation_matrix")
+            scenario_weights = params.get("scenario_probability_weights") or {
+                "bear": 0.25,
+                "base": 0.50,
+                "bull": 0.25,
+            }
+
+            self.think("Running parallel workers for DCF/scenario/comps/financial-statement/Monte Carlo analysis.")
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                scenario_future = pool.submit(
+                    engine.build_full_scenario_analysis,
+                    wacc,
+                    terminal_growth_rate,
+                    float(net_debt),
+                    shares_for_valuation,
+                    projection_years,
+                )
+                comps_future = pool.submit(
+                    comps_engine.build_comps_snapshot,
+                    latest_revenue_for_comps,
+                    avg_margin_for_comps,
+                    float(net_debt),
+                    shares_for_valuation,
+                    deal_industry,
+                    is_private_company,
+                )
+                dcf_worker_future = pool.submit(
+                    lambda: {
+                        "enterprise_value": valuation_data.get("implied_enterprise_value"),
+                        "equity_value": valuation_data.get("implied_equity_value"),
+                        "implied_share_price": valuation_data.get("implied_share_price"),
+                        "wacc": wacc,
+                        "terminal_growth_rate": terminal_growth_rate,
+                    }
+                )
+                fs_worker_future = pool.submit(
+                    statement_analyzer.analyze,
+                    statement_payload,
+                    deal_industry,
+                )
+                monte_carlo_future = pool.submit(
+                    engine.run_monte_carlo,
+                    ufcf,
+                    wacc,
+                    terminal_growth_rate,
+                    float(net_debt),
+                    shares_for_valuation,
+                    mc_iterations,
+                    int(params.get("monte_carlo_seed") or 42),
+                    float(params.get("monte_carlo_growth_volatility") or 0.015),
+                    float(params.get("monte_carlo_margin_volatility") or 0.04),
+                    float(params.get("monte_carlo_wacc_volatility") or 0.01),
+                    float(params.get("monte_carlo_tgr_volatility") or 0.003),
+                    mc_correlation_matrix,
+                    mc_var_confidence,
+                )
+
+                scenario_data = scenario_future.result()
+                comps_snapshot = comps_future.result()
+                dcf_worker_snapshot = dcf_worker_future.result()
+                financial_statement_snapshot = fs_worker_future.result()
+                monte_carlo_snapshot = monte_carlo_future.result()
+
+            scenario_planning_snapshot = engine.probability_weighted_scenario_value(
+                scenario_data,
+                scenario_weights,
+            )
+
+            synthesis_summary = self._build_synthesis_summary(
+                dcf_worker_snapshot,
+                comps_snapshot,
+                scenario_data,
+            )
+            self.observe(
+                "Parallel workers completed: DCF summary, comps snapshot, scenario analysis, "
+                "financial statement health analysis, and Monte Carlo simulation."
+            )
+
             exit_multiple = float(params.get("exit_multiple") or risk_overlay["terminal_exit_multiple"])
             terminal_ebitda = projections_data["projections"]["ebitda"][-1] if projections_data["projections"]["ebitda"] else None
             tv_crosscheck = engine.terminal_value_crosscheck(
@@ -1446,6 +1702,26 @@ class FinancialModelingAgent(BaseAgent):
                 )
             if not llm_data:
                 warnings.append("EXTRACTION FAILED: using generic fallback values. Results do not reflect the uploaded company's actual financials.")
+            fs_health = (
+                financial_statement_snapshot.get("analysis", {})
+                .get("overall_health", {})
+                .get("status")
+            )
+            if fs_health in {"Poor", "Fair"}:
+                warnings.append(
+                    f"FINANCIAL HEALTH SIGNAL: {fs_health.upper()} based on ratio benchmark analysis. "
+                    "Review leverage, liquidity, and operating profitability assumptions."
+                )
+            mc_loss_prob = (
+                monte_carlo_snapshot.get("summary", {}).get("probability_of_loss")
+                if isinstance(monte_carlo_snapshot, dict)
+                else None
+            )
+            if isinstance(mc_loss_prob, (int, float)) and mc_loss_prob >= 0.30:
+                warnings.append(
+                    f"MONTE CARLO RISK SIGNAL: probability of loss is {mc_loss_prob * 100:.1f}%. "
+                    "Stress-case downside appears material."
+                )
 
             valuation_result = {
                 "header": {
@@ -1468,6 +1744,14 @@ class FinancialModelingAgent(BaseAgent):
                 "historical": projections_data.get("historical", {}),
                 "fy_labels": projections_data["projections"].get("fy_labels", []),
                 "scenarios": scenario_data,
+                "parallel_analysis": {
+                    "dcf_worker": dcf_worker_snapshot,
+                    "comps_worker": comps_snapshot,
+                    "financial_statement_worker": financial_statement_snapshot,
+                    "scenario_planning_worker": scenario_planning_snapshot,
+                    "monte_carlo_worker": monte_carlo_snapshot,
+                    "synthesis": synthesis_summary,
+                },
                 "ev_bridge": ev_bridge,
                 "tv_crosscheck": tv_crosscheck,
                 "sbc_adjusted": sbc_data,

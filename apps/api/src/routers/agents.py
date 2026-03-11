@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
-from typing import Dict, Any, List
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from typing import Dict, Any
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from store import store
@@ -42,13 +42,29 @@ async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
             input_payload=payload.model_dump()
         )
         orch_id = orchestrator.run()
-        
-        target_agent = payload.agent_type
-        if target_agent == 'modeling':
-            specialized_agent = FinancialModelingAgent(deal_id, payload.model_dump())
+
+        orchestrator_record = store.agent_runs.get(orch_id)
+        if not orchestrator_record:
+            raise HTTPException(status_code=500, detail="Orchestrator run record not found")
+
+        if orchestrator_record.status != "completed":
+            raise HTTPException(
+                status_code=422,
+                detail=orchestrator_record.error_message or "Routing failed"
+            )
+
+        route = orchestrator_record.input_payload.get("route_decision", {})
+        target_agent = route.get("target_agent")
+        target_task = route.get("target_task")
+
+        if target_agent == "modeling" and target_task == "dcf_model":
+            specialized_payload = payload.model_dump()
+            specialized_payload["agent_type"] = target_agent
+            specialized_payload["task_name"] = target_task
+            specialized_agent = FinancialModelingAgent(deal_id, specialized_payload)
             run_id = specialized_agent.run()
         else:
-            run_id = orch_id # fallback if agent not implemented
+            run_id = orch_id
             
         # Fetch the resulting run log from the store
         run_record = store.agent_runs.get(run_id)
@@ -59,6 +75,7 @@ async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
                 "run_id": run_id,
                 "status": run_record.status if run_record else "unknown",
                 "steps": run_record.reasoning_steps if run_record else [],
+                "route": route,
                 "valuation_result": run_record.input_payload.get("valuation_result") if run_record else None
             },
             meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")

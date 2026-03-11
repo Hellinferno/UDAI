@@ -1,4 +1,7 @@
 from typing import Dict, List, Any, Optional, Tuple
+import random
+import statistics
+import math
 
 class DCFEngine:
     """
@@ -608,3 +611,259 @@ class DCFEngine:
             }
         
         return scenarios
+
+    def probability_weighted_scenario_value(self, scenario_data: Dict[str, Any],
+                                            probability_weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        """Compute expected value from Bear/Base/Bull scenario outputs."""
+        if not scenario_data:
+            return {
+                "expected_value": None,
+                "weights": {},
+                "metric": None,
+                "note": "No scenario data available",
+            }
+
+        weights = probability_weights or {
+            "bear": 0.25,
+            "base": 0.50,
+            "bull": 0.25,
+        }
+
+        # Normalize weights to sum to 1.
+        total = sum(max(0.0, float(v)) for v in weights.values())
+        if total <= 0:
+            weights = {"bear": 0.25, "base": 0.50, "bull": 0.25}
+            total = 1.0
+        normalized = {k: max(0.0, float(v)) / total for k, v in weights.items()}
+
+        # Prefer per-share if available, else fallback to equity value.
+        metric = "share_price"
+        has_share_price = all(
+            scenario_data.get(name, {}).get("valuation", {}).get("share_price") is not None
+            for name in ["bear", "base", "bull"]
+            if name in scenario_data
+        )
+        if not has_share_price:
+            metric = "equity_value"
+
+        expected_value = 0.0
+        weighted_rows = []
+        for name, scenario in scenario_data.items():
+            val_block = scenario.get("valuation", {})
+            value = val_block.get("share_price") if metric == "share_price" else val_block.get("equity_value")
+            if not isinstance(value, (int, float)):
+                continue
+            w = normalized.get(name, 0.0)
+            weighted_rows.append({
+                "scenario": name,
+                "weight": round(w, 4),
+                "value": round(float(value), 4),
+                "weighted_value": round(float(value) * w, 4),
+            })
+            expected_value += float(value) * w
+
+        return {
+            "expected_value": round(expected_value, 4),
+            "weights": {k: round(v, 4) for k, v in normalized.items()},
+            "metric": metric,
+            "details": weighted_rows,
+        }
+
+    def run_monte_carlo(self,
+                        ufcf_base: List[float],
+                        wacc: float,
+                        tgr: float,
+                        net_debt: float,
+                        shares: Optional[float],
+                        iterations: int = 1000,
+                        seed: int = 42,
+                        growth_volatility: float = 0.015,
+                        margin_volatility: float = 0.04,
+                        wacc_volatility: float = 0.01,
+                        tgr_volatility: float = 0.003,
+                        correlation_matrix: Optional[Dict[str, Dict[str, float]]] = None,
+                        var_confidence_level: float = 0.95) -> Dict[str, Any]:
+        """
+        Monte Carlo simulation around base DCF inputs.
+        Returns distribution stats and confidence intervals.
+        """
+        if not ufcf_base:
+            return {
+                "iterations": 0,
+                "metric": None,
+                "distribution": [],
+                "summary": {"error": "Empty UFCF base series"},
+            }
+
+        iterations = max(100, int(iterations or 1000))
+        random.seed(seed)
+
+        use_share_price = shares is not None and shares > 0
+        metric = "share_price" if use_share_price else "equity_value"
+        outputs: List[float] = []
+
+        factor_names = ["growth", "margin", "wacc", "tgr"]
+
+        def _build_corr_lookup() -> Dict[str, Dict[str, float]]:
+            defaults = {
+                "growth": {"margin": 0.45, "wacc": -0.35, "tgr": 0.20},
+                "margin": {"growth": 0.45, "wacc": -0.25, "tgr": 0.15},
+                "wacc": {"growth": -0.35, "margin": -0.25, "tgr": 0.40},
+                "tgr": {"growth": 0.20, "margin": 0.15, "wacc": 0.40},
+            }
+            if not isinstance(correlation_matrix, dict):
+                return defaults
+            merged = {
+                key: dict(value)
+                for key, value in defaults.items()
+            }
+            for k, nested in correlation_matrix.items():
+                if k in merged and isinstance(nested, dict):
+                    for k2, corr in nested.items():
+                        if k2 in factor_names and k2 != k:
+                            merged[k][k2] = max(-0.95, min(0.95, float(corr)))
+            return merged
+
+        def _build_corr_matrix(lookup: Dict[str, Dict[str, float]]) -> List[List[float]]:
+            matrix: List[List[float]] = []
+            for i_name in factor_names:
+                row: List[float] = []
+                for j_name in factor_names:
+                    if i_name == j_name:
+                        row.append(1.0)
+                    else:
+                        corr = lookup.get(i_name, {}).get(j_name)
+                        if corr is None:
+                            corr = lookup.get(j_name, {}).get(i_name, 0.0)
+                        row.append(max(-0.95, min(0.95, float(corr))))
+                matrix.append(row)
+            return matrix
+
+        def _cholesky_decompose(matrix: List[List[float]]) -> Optional[List[List[float]]]:
+            n = len(matrix)
+            l = [[0.0] * n for _ in range(n)]
+            try:
+                for i in range(n):
+                    for j in range(i + 1):
+                        s = sum(l[i][k] * l[j][k] for k in range(j))
+                        if i == j:
+                            diag = matrix[i][i] - s
+                            if diag <= 0:
+                                return None
+                            l[i][j] = math.sqrt(diag)
+                        else:
+                            if l[j][j] == 0:
+                                return None
+                            l[i][j] = (matrix[i][j] - s) / l[j][j]
+            except Exception:
+                return None
+            return l
+
+        corr_lookup = _build_corr_lookup()
+        corr_matrix = _build_corr_matrix(corr_lookup)
+        cholesky = _cholesky_decompose(corr_matrix)
+        if not cholesky:
+            corr_matrix = [
+                [1.0 if i == j else 0.0 for j in range(len(factor_names))]
+                for i in range(len(factor_names))
+            ]
+            cholesky = _cholesky_decompose(corr_matrix)
+
+        for _ in range(iterations):
+            z = [random.gauss(0.0, 1.0) for _ in factor_names]
+            correlated = [
+                sum(cholesky[i][k] * z[k] for k in range(len(factor_names)))
+                for i in range(len(factor_names))
+            ]
+            growth_shock = correlated[0] * growth_volatility
+            margin_shock = correlated[1] * margin_volatility
+            wacc_shock = correlated[2] * wacc_volatility
+            tgr_shock = correlated[3] * tgr_volatility
+
+            # Keep sampled parameters in sane bounds.
+            sampled_wacc = max(0.06, min(0.30, wacc + wacc_shock))
+            sampled_tgr = max(0.005, min(0.06, tgr + tgr_shock))
+            if sampled_tgr >= sampled_wacc - 0.01:
+                sampled_tgr = max(0.005, sampled_wacc - 0.01)
+
+            sampled_ufcf = []
+            for i, cf in enumerate(ufcf_base):
+                period_growth = (1.0 + growth_shock) ** (i + 1)
+                shocked_cf = cf * period_growth * (1.0 + margin_shock)
+                sampled_ufcf.append(shocked_cf)
+
+            try:
+                val = self.calculate_valuation(sampled_ufcf, sampled_wacc, sampled_tgr, net_debt, shares)
+                metric_val = val["implied_share_price"] if use_share_price else val["implied_equity_value"]
+                if isinstance(metric_val, (int, float)):
+                    outputs.append(float(metric_val))
+            except Exception:
+                continue
+
+        if not outputs:
+            return {
+                "iterations": iterations,
+                "metric": metric,
+                "distribution": [],
+                "summary": {"error": "No valid Monte Carlo samples produced"},
+            }
+
+        sorted_vals = sorted(outputs)
+        n = len(sorted_vals)
+
+        def pct(p: float) -> float:
+            idx = min(n - 1, max(0, int(round((p / 100.0) * (n - 1)))))
+            return sorted_vals[idx]
+
+        mean_val = statistics.fmean(sorted_vals)
+        median_val = statistics.median(sorted_vals)
+        std_val = statistics.pstdev(sorted_vals) if n > 1 else 0.0
+        p5 = pct(5)
+        p95 = pct(95)
+        p10 = pct(10)
+        p90 = pct(90)
+
+        var_confidence_level = max(0.80, min(0.995, float(var_confidence_level or 0.95)))
+        tail_percentile = (1.0 - var_confidence_level) * 100.0
+        var_value = pct(tail_percentile)
+        tail_values = [v for v in sorted_vals if v <= var_value]
+        cvar_value = statistics.fmean(tail_values) if tail_values else var_value
+
+        prob_negative = sum(1 for x in sorted_vals if x < 0) / n
+        prob_above_base = sum(1 for x in sorted_vals if x > median_val) / n
+
+        return {
+            "iterations": n,
+            "metric": metric,
+            "summary": {
+                "mean": round(mean_val, 4),
+                "median": round(median_val, 4),
+                "std_dev": round(std_val, 4),
+                "p5": round(p5, 4),
+                "p10": round(p10, 4),
+                "p90": round(p90, 4),
+                "p95": round(p95, 4),
+                "confidence_interval_90": [round(p5, 4), round(p95, 4)],
+                "probability_of_loss": round(prob_negative, 4),
+                "probability_above_median": round(prob_above_base, 4),
+                "var_confidence_level": round(var_confidence_level, 4),
+                "var_value": round(var_value, 4),
+                "cvar_value": round(cvar_value, 4),
+                "var_downside_from_mean": round(max(0.0, mean_val - var_value), 4),
+                "cvar_downside_from_mean": round(max(0.0, mean_val - cvar_value), 4),
+            },
+            # Keep payload bounded for API consumers.
+            "distribution_preview": {
+                "min": round(sorted_vals[0], 4),
+                "max": round(sorted_vals[-1], 4),
+                "sample": [round(v, 4) for v in sorted_vals[::max(1, n // 25)]][:25],
+            },
+            "assumptions": {
+                "growth_volatility": growth_volatility,
+                "margin_volatility": margin_volatility,
+                "wacc_volatility": wacc_volatility,
+                "tgr_volatility": tgr_volatility,
+                "seed": seed,
+                "correlation_matrix": corr_matrix,
+            },
+        }

@@ -257,6 +257,108 @@ This is the primary endpoint. The frontend calls this to invoke any agent.
 }
 ```
 
+### Modeling Task Parameters (`agent_type=modeling`, `task_name=dcf_model`)
+
+The following optional parameters are now supported for advanced scenario and risk analysis:
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `scenario_probability_weights` | object | `{ "bear": 0.25, "base": 0.50, "bull": 0.25 }` | Probability weights for scenario-planning expected value. Weights are normalized server-side. |
+| `monte_carlo_iterations` | int | `1500` | Number of Monte Carlo paths (`>= 100`). |
+| `monte_carlo_seed` | int | `42` | Random seed for deterministic replay. |
+| `monte_carlo_growth_volatility` | float | `0.015` | Std-dev of growth shock. |
+| `monte_carlo_margin_volatility` | float | `0.04` | Std-dev of margin shock. |
+| `monte_carlo_wacc_volatility` | float | `0.01` | Std-dev of WACC shock. |
+| `monte_carlo_tgr_volatility` | float | `0.003` | Std-dev of terminal-growth shock. |
+| `monte_carlo_var_confidence_level` | float | `0.95` | Tail confidence for VaR/CVaR reporting. Accepted range: `0.80` to `0.995`. |
+| `monte_carlo_correlation_matrix` | object | internal default | Optional correlation matrix across factors `growth`, `margin`, `wacc`, `tgr`. |
+
+`monte_carlo_correlation_matrix` shape example:
+```json
+{
+  "growth": { "margin": 0.60, "wacc": -0.40, "tgr": 0.30 },
+  "margin": { "wacc": -0.20, "tgr": 0.20 },
+  "wacc": { "tgr": 0.50 }
+}
+```
+
+### Modeling Result Contract Additions
+
+When run details include valuation output, the object now contains a `parallel_analysis` block with worker-level outputs:
+
+```json
+{
+  "parallel_analysis": {
+    "dcf_worker": {
+      "enterprise_value": 12345.67,
+      "equity_value": 11234.56,
+      "implied_share_price": 145.12,
+      "wacc": 0.112,
+      "terminal_growth_rate": 0.03
+    },
+    "comps_worker": {
+      "method": "ev_ebitda_comps",
+      "industry": "IT Services",
+      "multiple_band": { "bear": 14.0, "base": 18.0, "bull": 22.0 },
+      "scenarios": { "bear": {}, "base": {}, "bull": {} }
+    },
+    "financial_statement_worker": {
+      "industry_context": "technology",
+      "ratios": {},
+      "analysis": {
+        "overall_health": { "status": "Good", "score": 2.75 },
+        "recommendations": []
+      },
+      "trend_analysis": {
+        "signal": "Improving",
+        "score": 2,
+        "metrics": {
+          "current_ratio": { "signal": "Improving", "start": 1.4, "end": 2.1, "series": [1.4, 1.8, 2.1] },
+          "debt_to_equity": { "signal": "Improving", "start": 0.9, "end": 0.4, "series": [0.9, 0.6, 0.4] }
+        },
+        "period_count": 3
+      }
+    },
+    "scenario_planning_worker": {
+      "expected_value": 105.0,
+      "weights": { "bear": 0.2, "base": 0.5, "bull": 0.3 },
+      "metric": "share_price",
+      "details": []
+    },
+    "monte_carlo_worker": {
+      "iterations": 1500,
+      "metric": "share_price",
+      "summary": {
+        "mean": 147.9,
+        "median": 145.8,
+        "p5": 113.4,
+        "p95": 185.1,
+        "probability_of_loss": 0.02,
+        "var_confidence_level": 0.95,
+        "var_value": 113.4,
+        "cvar_value": 106.2,
+        "var_downside_from_mean": 34.5,
+        "cvar_downside_from_mean": 41.7
+      },
+      "distribution_preview": {
+        "min": 92.1,
+        "max": 223.8,
+        "sample": [92.1, 104.4, 118.8]
+      },
+      "assumptions": {
+        "growth_volatility": 0.015,
+        "margin_volatility": 0.04,
+        "wacc_volatility": 0.01,
+        "tgr_volatility": 0.003,
+        "seed": 42,
+        "correlation_matrix": [[1.0, 0.45, -0.35, 0.2], [0.45, 1.0, -0.25, 0.15], [-0.35, -0.25, 1.0, 0.4], [0.2, 0.15, 0.4, 1.0]]
+      }
+    },
+    "synthesis": "Parallel synthesis complete..."
+  }
+}
+```
+
 ---
 
 ### `GET /agents/runs/:run_id/stream` — Stream Agent Progress (SSE)
