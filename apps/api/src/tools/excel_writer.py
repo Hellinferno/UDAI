@@ -1,14 +1,26 @@
+import logging
 import os
+import re
+from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from typing import Dict, Any, List
 from openpyxl.utils import get_column_letter
 
+logger = logging.getLogger(__name__)
+_UNSAFE_CHARS = re.compile(r"[^a-z0-9_\-]")
+
+# Canonical output directory: apps/data/outputs (4 levels up from this file)
+_DEFAULT_OUTPUT_DIR = str(
+    Path(__file__).resolve().parent.parent.parent.parent / "data" / "outputs"
+)
+
+
 class WorkbookBuilder:
     """Tool to generate formatting-compliant IB Excel Models."""
-    
-    def __init__(self, output_dir: str = "aibaa/data/outputs"):
-        self.output_dir = output_dir
+
+    def __init__(self, output_dir: str = _DEFAULT_OUTPUT_DIR):
+        self.output_dir = os.path.abspath(output_dir)
         os.makedirs(self.output_dir, exist_ok=True)
         
         # IB Standard Formatting
@@ -374,9 +386,13 @@ class WorkbookBuilder:
             ws_sens.column_dimensions[col].width = 15
             
         # Save File
-        safe_name = deal_name.replace(" ", "_").lower()
+        safe_name = _UNSAFE_CHARS.sub("_", deal_name.strip().lower().replace(" ", "_"))[:60]
         filename = f"dcf_model_{safe_name}.xlsx"
         filepath = os.path.join(self.output_dir, filename)
+        # Guard: ensure path stays within output_dir
+        if not os.path.abspath(filepath).startswith(self.output_dir):
+            raise ValueError(f"Output path escapes output_dir: {filepath}")
+        logger.info("[ExcelWriter] Saving DCF workbook to %s", filepath)
         
         wb.save(filepath)
         return filepath

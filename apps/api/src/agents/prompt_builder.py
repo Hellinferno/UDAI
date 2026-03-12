@@ -35,7 +35,7 @@ Please execute a Discounted Cash Flow (DCF) model analysis based on the followin
 
 --- Parameters ---
 Years to Project: {parameters.get('projection_years', 5)}
-Terminal Growth Rate: {parameters.get('terminal_growth_rate', 0.025)}
+Terminal Growth Rate: {parameters.get('terminal_growth_rate', 0.030)}
 Override WACC: {parameters.get('wacc_override', 'None')}
 Currency: {parameters.get('currency', 'INR')}
 
@@ -103,7 +103,7 @@ STEP 1: IDENTIFY BASE FIGURES
 - Extract up to 5 years of historical revenue.
 - State the page or section where you found each number.
 - All monetary values must be returned in INR absolute numbers (after unit conversion).
-- SANITY CHECK: For a large-cap Indian listed company, revenue should be ₹10,000 Crores+ (₹100B+). For mega-cap IT companies like TCS, Infosys, HCL, revenue is ₹50,000+ Crores.
+- SANITY CHECK: For a large-cap Indian listed company, revenue should be ₹10,000 Crores+ (₹100B+). For mega-cap IT companies like TCS, Infosys, HCL, revenue is ₹50,000-2,00,000 Crores. For mega-cap diversified conglomerates (Reliance Industries, Adani Group, Tata Group), revenue can exceed ₹5,00,000 Crore (₹5 Lakh Crore). Always use CONSOLIDATED financials.
 
 STEP 2: EBITDA RECONCILIATION
 - For each year, compute EBITDA as:
@@ -147,6 +147,9 @@ STEP 3: BALANCE SHEET EXTRACTION
 STEP 4: CASH FLOW STATEMENT
 - CapEx = Purchase of Property, Plant and Equipment or Additions to Fixed Assets.
 - For asset-light IT services companies, CapEx is typically 3-5% of revenue.
+- For capital-intensive sectors (energy, refinery, O2C chemicals, telecom, manufacturing, power,
+  infrastructure, mining), CapEx is typically 8-12% of revenue. A figure below 5% for these
+  sectors is a red flag — re-check the Cash Flow Statement carefully.
 - cap_ex_percent_rev = CapEx / Latest Revenue.
 - D&A from P&L and da_percent_rev = D&A / Latest Revenue.
 - Operating Cash Flow (OCF) = "Cash generated from operations" or "Net cash from operating activities".
@@ -157,12 +160,29 @@ STEP 4: CASH FLOW STATEMENT
 STEP 5: MARKET PARAMETERS
 - Beta from the document if available. If not available in the document, return null.
 - For listed companies, if beta is not in the document, note the sector for estimation.
+- WACC GUIDANCE BY SECTOR (for reference; the DCF engine will compute the actual WACC):
+  * Large-cap diversified conglomerate (RIL, Adani, Tata): Beta ~1.0, NO size premium, WACC 10-13%
+  * Large-cap energy/O2C/refinery: Beta ~1.0-1.1, WACC 10-12%
+  * Large-cap telecom: Beta ~0.9-1.0, WACC 10-12%
+  * Large-cap IT services: Beta ~0.85-1.0, WACC 9-13%
+  * Mid/small-cap digital/fintech: Beta ~1.2-1.5, size premium 2-3%, WACC 14-20%
 - Base Fiscal Year = the most recent completed fiscal year.
 - If annual report contains fair-value valuation assumptions, extract:
   - discount_rate_reference
   - forecast_revenue_growth_range
-  - terminal_growth_reference
+  - terminal_growth_reference (default 3.0% for India GDP-aligned growth)
 - Identify the company's primary industry/sector for appropriate WACC estimation.
+
+STEP 6: SEGMENT REPORTING (for diversified companies)
+- If the company has multiple business segments, extract the latest fiscal year segment data:
+  * Segment name, segment revenue (₹ Crore), segment EBITDA/EBIT (₹ Crore), segment EBITDA margin.
+  * Common segments for Indian conglomerates: O2C (Oil-to-Chemicals), Retail, Digital/Telecom,
+    Oil & Gas E&P, Financial Services, Media & Entertainment, New Energy.
+- Typical EBITDA margin ranges by segment:
+  * O2C / Refining: 8-12%  |  Retail: 7-9%  |  Telecom/Digital: 35-50%
+  * E&P / Upstream: 70-85%  |  IT services: 18-28%  |  FMCG: 15-22%
+- Return segment data in the segment_revenues and segment_ebitda_margins fields.
+- This is optional but highly important for accurate blended EBITDA margin computation.
 
 STEP 6: CONFIDENCE SELF-ASSESSMENT
 - 1.0 = exact number with citation
@@ -199,6 +219,8 @@ Return only one JSON object with this structure:
   "profit_after_tax": {{"value": <number_or_null>, "confidence": 0.9, "source": "P&L Statement"}},
   "basic_eps": {{"value": <number_or_null>, "confidence": 0.9, "source": "P&L Statement / EPS note"}},
   "operating_cash_flow": {{"value": <number_or_null>, "confidence": 0.8, "source": "Cash Flow Statement"}},
+  "segment_revenues": {{"value": {{"<segment_name>": <crore_value>, ...}} or null, "confidence": 0.75, "source": "Segment reporting note"}},
+  "segment_ebitda_margins": {{"value": {{"<segment_name>": <decimal_ebitda_margin>, ...}} or null, "confidence": 0.70, "source": "Segment reporting note"}},
   "currency": "INR"
 }}
 """.strip()

@@ -1,33 +1,22 @@
 import uuid
-from datetime import datetime
+import logging
 from typing import Dict, Any
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from store import store
+from models import APIResponse, Meta
 from agents.orchestrator import OrchestratorAgent
 from agents.modeling import FinancialModelingAgent
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/deals", tags=["Agents"])
 
-class Meta(BaseModel):
-    timestamp: str = ""
-    request_id: str
-
-    def __init__(self, **data):
-        if "timestamp" not in data:
-            data["timestamp"] = datetime.utcnow().isoformat() + "Z"
-        super().__init__(**data)
-
-class APIResponse(BaseModel):
-    success: bool
-    data: Any
-    meta: Meta
 
 class AgentRunPayload(BaseModel):
-    agent_type: str
-    task_name: str
-    parameters: Dict[str, Any] = {}
+    agent_type: str = Field(..., min_length=1, max_length=40)
+    task_name: str = Field(..., min_length=1, max_length=80)
+    parameters: Dict[str, Any] = Field(default_factory=dict)
 
 @router.post("/{deal_id}/agents/run", response_model=APIResponse)
 async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
@@ -82,8 +71,8 @@ async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
         )
         
     except Exception as e:
-        print(f"Agent dispatch failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Agent dispatch failed for deal %s", deal_id)
+        raise HTTPException(status_code=500, detail="Agent execution failed. Check server logs for details.")
 
 @router.get("/{deal_id}/agents/runs", response_model=APIResponse)
 async def list_agent_runs(deal_id: str):

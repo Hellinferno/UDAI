@@ -1,151 +1,214 @@
 import os
+import re
 import uuid
-import shutil
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, status
 from typing import List, Optional
 
 from models import APIResponse, Meta
 from store import store, Document
+from tools.document_parser import parse_document
+
+# Background parser pool: same as startup recovery
+_parser_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="doc_parse")
 
 router = APIRouter(prefix="/deals/{deal_id}/documents", tags=["Documents"])
 
-UPLOAD_DIR = os.path.join(os.path.dirname(__file__), "../../../data/uploads")
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+_UPLOAD_BASE = Path(__file__).resolve().parent.parent.parent.parent / "data" / "uploads"
+_UPLOAD_BASE.mkdir(parents=True, exist_ok=True)
+
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "150"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
+# Allowlisted extensions and their expected magic-byte prefixes.
+# None means magic-bytes check is skipped (text-based formats).
+_ALLOWED_TYPES: dict[str, Optional[bytes]] = {
+    "pdf":  b"%PDF",
+    "docx": b"PK\x03\x04",   # Office Open XML (ZIP)
+    "xlsx": b"PK\x03\x04",
+    "xls":  b"\xd0\xcf\x11\xe0",  # Compound Document (old Office)
+    "csv":  None,
+    "txt":  None,
+    "json": None,
+}
+
+_SAFE_NAME_RE = re.compile(r"[^a-z0-9_.\-]")
+
+
+def _parse_document_async(file_id: str, file_path: str, file_type: str):
+    """Parse document in background and update store status."""
+    try:
+        parsed_text = parse_document(file_path, file_type)
+        doc = store.documents.get(file_id)
+        if doc:
+            doc.parsed_text = parsed_text
+            doc.parse_status = "parsed" if parsed_text else "parse_failed"
+    except Exception as exc:
+        doc = store.documents.get(file_id)
+        if doc:
+            doc.parse_status = "parse_failed"
+        print(f"[PARSE_ERROR] {file_id}: {exc}")
+
+
+def _sanitize_filename(raw: str) -> str:
+    """Return a safe filename: lowercase, only alphanumeric/dot/hyphen/underscore."""
+    name = os.path.basename(raw or "upload").lower().replace(" ", "_")
+    name = _SAFE_NAME_RE.sub("_", name)
+    # Strip leading dots (hidden files) and limit length
+    name = name.lstrip(".") or "upload"
+    return name[:120]
+
+
+def _magic_ok(content: bytes, ext: str) -> bool:
+    """Verify first bytes match the expected signature for the declared extension."""
+    expected = _ALLOWED_TYPES.get(ext)
+    if expected is None:
+        return True  # text-based; no magic bytes to check
+    return content[: len(expected)] == expected
+
+
 @router.post("", response_model=APIResponse, status_code=status.HTTP_201_CREATED)
 async def upload_documents(
-    deal_id: str, 
+    deal_id: str,
     files: List[UploadFile] = File(...),
-    category: Optional[str] = Form(None)
+    category: Optional[str] = Form(None),
 ):
     deal = store.get_deal(deal_id)
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-        
+
+    # Validate category to prevent storing arbitrary strings
+    if category and len(category) > 60:
+        raise HTTPException(status_code=400, detail="Category too long")
+
+    deal_upload_dir = _UPLOAD_BASE / deal_id
+    deal_upload_dir.mkdir(parents=True, exist_ok=True)
+
     uploaded_docs = []
     failed_docs = []
-    
-    deal_upload_dir = os.path.join(UPLOAD_DIR, deal_id)
-    os.makedirs(deal_upload_dir, exist_ok=True)
-    
+
     for file in files:
-        file_id = str(uuid.uuid4())
-        safe_filename = file.filename.replace(" ", "_").lower()
-        file_extension = safe_filename.split(".")[-1] if "." in safe_filename else "unknown"
-        
-        print(f"[UPLOAD] Received file: {file.filename} -> ext={file_extension}, deal={deal_id}")
-        
-        # Determine strict type or default to unknown
-        supported_types = ["pdf", "docx", "xlsx", "xls", "csv", "txt", "json"]
-        doc_type = file_extension if file_extension in supported_types else "unknown"
-        
-        if doc_type == "unknown":
-            reason = f"Unsupported file type: {file_extension}"
-            print(f"[UPLOAD] REJECTED: {reason}")
-            failed_docs.append({"filename": safe_filename, "reason": reason})
+        safe_filename = _sanitize_filename(file.filename or "upload")
+        ext = safe_filename.rsplit(".", 1)[-1] if "." in safe_filename else "unknown"
+
+        if ext not in _ALLOWED_TYPES:
+            failed_docs.append({"filename": safe_filename, "reason": f"Unsupported file type: .{ext}"})
             continue
-        
-        file_path = os.path.join(deal_upload_dir, f"{file_id}_{safe_filename}")
-        
-        # Save to disk
-        try:
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            
-            file_size = os.path.getsize(file_path)
-            
-            # Enforce configurable upload limit
-            if file_size > MAX_UPLOAD_BYTES:
-                os.remove(file_path) # Cleanup
-                failed_docs.append({
-                    "filename": safe_filename,
-                    "reason": f"File exceeds {MAX_UPLOAD_MB}MB limit: {safe_filename}"
-                })
-                continue
-                
-            # Create store entity
-            new_doc = Document(
-                id=file_id,
-                deal_id=deal_id,
-                filename=safe_filename,
-                file_type=doc_type,
-                file_size_bytes=file_size,
-                storage_path=file_path,
-                doc_category=category,
-                parse_status="ready"
-            )
-            store.documents[file_id] = new_doc
-            
-            uploaded_docs.append({
-                "id": new_doc.id,
-                "filename": new_doc.filename,
-                "file_type": new_doc.file_type,
-                "file_size_bytes": new_doc.file_size_bytes,
-                "parse_status": new_doc.parse_status,
-                "uploaded_at": new_doc.uploaded_at.isoformat()
+
+        # Read up to limit + 1 byte in memory BEFORE touching disk.
+        # This prevents disk-filling attacks and avoids write-then-delete.
+        content = await file.read(MAX_UPLOAD_BYTES + 1)
+
+        if len(content) > MAX_UPLOAD_BYTES:
+            failed_docs.append({
+                "filename": safe_filename,
+                "reason": f"File exceeds {MAX_UPLOAD_MB} MB limit",
             })
-            
-        except Exception as e:
-            print(f"Failed to save file: {e}")
-            failed_docs.append({"filename": safe_filename, "reason": str(e)})
             continue
+
+        if not _magic_ok(content, ext):
+            failed_docs.append({
+                "filename": safe_filename,
+                "reason": f"File content does not match declared extension .{ext}",
+            })
+            continue
+
+        file_id = str(uuid.uuid4())
+        dest_path = deal_upload_dir / f"{file_id}_{safe_filename}"
+
+        # Guard: resolved path must stay inside deal_upload_dir
+        if not str(dest_path.resolve()).startswith(str(deal_upload_dir.resolve())):
+            failed_docs.append({"filename": safe_filename, "reason": "Invalid filename"})
+            continue
+
+        try:
+            dest_path.write_bytes(content)
+        except OSError as exc:
+            failed_docs.append({"filename": safe_filename, "reason": "Server error saving file"})
+            print(f"[UPLOAD] OSError saving {safe_filename}: {exc}")
+            continue
+
+        new_doc = Document(
+            id=file_id,
+            deal_id=deal_id,
+            filename=safe_filename,
+            file_type=ext,
+            file_size_bytes=len(content),
+            storage_path=str(dest_path),
+            doc_category=category,
+            parse_status="parsing",
+        )
+        store.documents[file_id] = new_doc
+
+        # Queue parsing to run in background thread pool
+        # This prevents the upload response from being blocked
+        _parser_pool.submit(_parse_document_async, file_id, str(dest_path), ext)
+
+        uploaded_docs.append({
+            "id": new_doc.id,
+            "filename": new_doc.filename,
+            "file_type": new_doc.file_type,
+            "file_size_bytes": new_doc.file_size_bytes,
+            "parse_status": new_doc.parse_status,
+            "uploaded_at": new_doc.uploaded_at.isoformat(),
+        })
 
     if not uploaded_docs and failed_docs:
         detail = "; ".join(f"{item['filename']}: {item['reason']}" for item in failed_docs[:3])
         raise HTTPException(status_code=400, detail=detail)
-            
+
     return APIResponse(
         success=True,
-        data={
-            "uploaded": uploaded_docs,
-            "failed": failed_docs
-        },
-        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")
+        data={"uploaded": uploaded_docs, "failed": failed_docs},
+        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
     )
+
 
 @router.get("", response_model=APIResponse)
 async def list_documents(deal_id: str):
     deal = store.get_deal(deal_id)
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-        
+
     docs = store.get_documents_for_deal(deal_id)
-    
-    doc_list = []
-    for d in docs:
-        doc_list.append({
-            "id": d.id,
-            "filename": d.filename,
-            "file_type": d.file_type,
-            "file_size_bytes": d.file_size_bytes,
-            "doc_category": d.doc_category,
-            "parse_status": d.parse_status,
-            "uploaded_at": d.uploaded_at.isoformat()
-        })
-        
     return APIResponse(
         success=True,
-        data=doc_list,
-        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")
+        data=[
+            {
+                "id": d.id,
+                "filename": d.filename,
+                "file_type": d.file_type,
+                "file_size_bytes": d.file_size_bytes,
+                "doc_category": d.doc_category,
+                "parse_status": d.parse_status,
+                "uploaded_at": d.uploaded_at.isoformat(),
+            }
+            for d in docs
+        ],
+        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
     )
+
 
 @router.delete("/{doc_id}", response_model=APIResponse)
 async def delete_document(deal_id: str, doc_id: str):
     doc = store.documents.get(doc_id)
     if not doc or doc.deal_id != deal_id:
         raise HTTPException(status_code=404, detail="Document not found")
-        
+
     # Delete from filesystem
-    if os.path.exists(doc.storage_path):
-        os.remove(doc.storage_path)
-        
-    # Delete from store
+    doc_path = Path(doc.storage_path)
+    # Safety: only delete if it's still inside the upload base
+    try:
+        if doc_path.resolve().is_relative_to(_UPLOAD_BASE.resolve()) and doc_path.exists():
+            doc_path.unlink()
+    except (ValueError, OSError):
+        pass  # Log but don't expose internals
+
     del store.documents[doc_id]
-    
+
     return APIResponse(
         success=True,
         data={"id": doc_id, "message": "Document deleted successfully"},
-        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")
+        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
     )

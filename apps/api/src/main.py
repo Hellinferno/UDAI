@@ -1,30 +1,76 @@
 import sys
 import os
+import asyncio
+import uuid
+import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-# Add the src directory to Python path for proper imports
+# Add the src directory to Python path so all modules can be imported
+# by name without installing as a package (uvicorn runs from apps/api/).
 src_path = Path(__file__).parent
-sys.path.insert(0, str(src_path))
+if str(src_path) not in sys.path:
+    sys.path.insert(0, str(src_path))
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic_settings import BaseSettings
 
 from routers import deals, documents, agents, outputs
 
+
 class Settings(BaseSettings):
     app_name: str = "AIBAA Orchestration API"
     version: str = "1.0.0"
+    # Comma-separated list of allowed CORS origins; override via env var.
+    allowed_origins: str = (
+        "http://localhost:5173,http://localhost:3000,"
+        "http://127.0.0.1:5173,http://127.0.0.1:3000"
+    )
+
+    model_config = {"env_prefix": "AIBAA_"}
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Attach security-related HTTP response headers to every response."""
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        # Remove server fingerprint header if present
+        if "server" in response.headers:
+            del response.headers["server"]
+        return response
+
 
 settings = Settings()
-app = FastAPI(title=settings.app_name, version=settings.version)
 
+_origins = [o.strip() for o in settings.allowed_origins.split(",") if o.strip()]
+
+app = FastAPI(
+    title=settings.app_name,
+    version=settings.version,
+    # Disable /docs and /redoc in production via env; keep on by default for dev.
+    docs_url="/docs" if os.environ.get("AIBAA_ENV", "development") != "production" else None,
+    redoc_url="/redoc" if os.environ.get("AIBAA_ENV", "development") != "production" else None,
+)
+
+# Middleware order matters: outermost first.
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173", "http://127.0.0.1:3000"],
+    allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Request-ID"],
+    max_age=600,
 )
 
 app.include_router(deals.router, prefix="/api/v1")
@@ -33,6 +79,97 @@ app.include_router(agents.router, prefix="/api/v1")
 app.include_router(outputs.deal_router, prefix="/api/v1")
 app.include_router(outputs.output_router, prefix="/api/v1")
 
-@app.get("/api/v1/health")
+
+@app.get("/api/v1/health", tags=["Health"])
 async def health_check():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Startup: recover deals + documents from disk, then parse in background
+# ---------------------------------------------------------------------------
+
+_UPLOAD_BASE = Path(__file__).resolve().parent.parent.parent / "data" / "uploads"
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+_ALLOWED_EXTS = {"pdf", "docx", "xlsx", "xls", "csv", "txt", "json"}
+
+_parse_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="doc-parser")
+
+
+def _parse_in_thread(doc_id: str) -> None:
+    """Parse a single document in a background thread; update store in-place."""
+    from store import store
+    from tools.document_parser import parse_document
+
+    doc = store.documents.get(doc_id)
+    if not doc or doc.parsed_text:
+        return
+    doc.parse_status = "parsing"
+    text = parse_document(doc.storage_path, doc.file_type)
+    doc.parsed_text = text
+    doc.parse_status = "parsed" if text else "parse_failed"
+
+
+@app.on_event("startup")
+async def _recover_uploads() -> None:
+    """
+    On startup, scan the uploads directory and reconstruct in-memory state
+    for all deals and documents that already exist on disk.  Each document
+    is then parsed in a background thread pool so parsed_text is available
+    without blocking the event loop.
+    """
+    from store import store
+    from store import Deal, Document
+
+    if not _UPLOAD_BASE.exists():
+        return
+
+    loop = asyncio.get_event_loop()
+    to_parse: list[str] = []
+
+    for deal_dir in _UPLOAD_BASE.iterdir():
+        if not deal_dir.is_dir():
+            continue
+        deal_id = deal_dir.name
+        if not _UUID_RE.match(deal_id):
+            continue
+
+        # Recover deal stub if not already present.
+        if deal_id not in store.deals:
+            store.deals[deal_id] = Deal(
+                id=deal_id,
+                name=f"Recovered Deal ({deal_id[:8]})",
+                company_name="(Restored from disk)",
+            )
+
+        for fpath in deal_dir.iterdir():
+            if not fpath.is_file():
+                continue
+            ext = fpath.suffix.lstrip(".").lower()
+            if ext not in _ALLOWED_EXTS:
+                continue
+
+            # Filename format: {file_id}_{original_name}
+            name_part = fpath.name
+            maybe_id = name_part.split("_", 1)[0]
+            file_id = maybe_id if _UUID_RE.match(maybe_id) else str(uuid.uuid4())
+            original_name = name_part[len(maybe_id) + 1:] if _UUID_RE.match(maybe_id) else name_part
+
+            if file_id in store.documents:
+                continue  # already registered (e.g. just uploaded this session)
+
+            doc = Document(
+                id=file_id,
+                deal_id=deal_id,
+                filename=original_name,
+                file_type=ext,
+                file_size_bytes=fpath.stat().st_size,
+                storage_path=str(fpath),
+                parse_status="pending",
+            )
+            store.documents[file_id] = doc
+            to_parse.append(file_id)
+
+    # Fire off parsing in the background — don't await so startup completes fast.
+    for doc_id in to_parse:
+        loop.run_in_executor(_parse_executor, _parse_in_thread, doc_id)

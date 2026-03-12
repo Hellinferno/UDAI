@@ -1,14 +1,10 @@
-"""
-Preparer agent for financial-data extraction.
-
-This stage forces the model to produce:
-1. Reconciliation notes
-2. Per-field citations
-3. Confidence scores
-"""
-from typing import Dict, Any
+"""Preparer agent for financial-data extraction."""
 import json
+import logging
 import re
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 from engine.llm import ask_llm
 from agents.prompt_builder import PromptBuilder
@@ -69,11 +65,11 @@ class PreparerAgent:
                 "extraction_mode": extraction_mode,
             }
         except Exception as exc:
-            print(f"[Preparer] Extraction failed: {exc}")
+            logger.exception("[Preparer] Extraction failed")
             return {
                 "extracted_data": {},
                 "audit_trail": [],
-                "reconciliation_log": f"Extraction failed: {exc}",
+                "reconciliation_log": "Extraction failed. Check server logs.",
                 "extraction_mode": "failed",
             }
 

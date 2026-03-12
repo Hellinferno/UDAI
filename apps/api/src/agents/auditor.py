@@ -1,11 +1,10 @@
-"""
-Auditor agent for verifying extracted financial data.
-
-This checker challenges the preparer output using accounting logic and citations.
-"""
-from typing import Dict, Any
+"""Auditor agent for verifying extracted financial data."""
+import logging
 import json
 import re
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 from engine.llm import ask_llm
 from agents.prompt_builder import PromptBuilder
@@ -56,21 +55,20 @@ class AuditorAgent:
             raw_response = ask_llm(auditor_system, prompt)
             return cls._parse_auditor_response(raw_response)
         except Exception as exc:
-            print(f"[Auditor] Audit failed: {exc}")
-            verdicts = []
-            for entry in audit_trail:
-                verdicts.append(
-                    {
-                        "field": entry["field"],
-                        "status": "flagged",
-                        "auditor_confidence": 0.4,
-                        "reason": f"Auditor unavailable ({exc}). Flagged for review.",
-                    }
-                )
+            logger.exception("[Auditor] Audit failed")
+            verdicts = [
+                {
+                    "field": entry["field"],
+                    "status": "flagged",
+                    "auditor_confidence": 0.4,
+                    "reason": "Auditor unavailable. Flagged for review.",
+                }
+                for entry in audit_trail
+            ]
             return {
                 "overall_status": "flagged",
                 "field_verdicts": verdicts,
-                "auditor_notes": f"Auditor agent failed: {exc}. All fields flagged.",
+                "auditor_notes": "Auditor agent failed. All fields flagged. Check server logs.",
                 "corrections": {},
             }
 

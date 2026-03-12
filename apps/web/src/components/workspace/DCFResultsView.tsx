@@ -51,6 +51,10 @@ export default function DCFResultsView({ data }: Props) {
     const cur = h.currency === 'USD' ? '$' : 'Rs '
     const isPrivate = Boolean(h.is_private_company)
     const hasPerShareValue = h.implied_share_price !== undefined && h.implied_share_price !== null
+    const checkpoint = data.extraction_quality?.checkpoint
+    const checkpointStatus = String(checkpoint?.status || '').toLowerCase()
+    const checkpointBlockingIssues = Array.isArray(checkpoint?.blocking_issues) ? checkpoint!.blocking_issues! : []
+    const topBlockingIssues = checkpointBlockingIssues.slice(0, 3)
     const sensitivityMetric = !isPrivate && data.sensitivity_labels?.metric !== 'equity_value' && hasPerShareValue
         ? 'Share Price'
         : 'Equity Value'
@@ -106,6 +110,11 @@ export default function DCFResultsView({ data }: Props) {
                 <div style={{ background: '#120d08', border: '1px solid #4a2a14', borderRadius: 3, padding: '14px 18px' }}>
                     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: data.warnings?.length ? 12 : 0 }}>
                         <span style={{ fontSize: 10, color: '#ffb36b', fontWeight: 700, letterSpacing: '0.08em' }}>MODEL WARNINGS</span>
+                        {checkpointStatus && (
+                            <span className={`badge ${checkpointStatus === 'passed' ? 'badge-emerald' : 'badge-rose'}`}>
+                                Checkpoint: {checkpointStatus === 'passed' ? 'PASSED' : 'FAILED'}
+                            </span>
+                        )}
                         {data.extraction_quality?.mode && (
                             <span style={{ fontSize: 11, color: '#c98a4a' }}>Source Mode: {data.extraction_quality.mode}</span>
                         )}
@@ -120,6 +129,22 @@ export default function DCFResultsView({ data }: Props) {
                             </span>
                         )}
                     </div>
+
+                    {topBlockingIssues.length > 0 && (
+                        <div style={{ marginBottom: data.warnings?.length ? 12 : 0, padding: '10px 12px', border: '1px solid rgba(204,51,51,0.25)', borderRadius: 2, background: 'rgba(204,51,51,0.05)' }}>
+                            <div style={{ fontSize: 10, fontWeight: 700, color: '#ff9b9b', letterSpacing: '0.06em', marginBottom: 6 }}>
+                                CHECKPOINT BLOCKING ISSUES
+                            </div>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                                {topBlockingIssues.map((issue, idx) => (
+                                    <div key={idx} style={{ fontSize: 12, color: '#f3d2b3', lineHeight: 1.45 }}>
+                                        • {issue}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    )}
+
                     {data.warnings?.length ? (
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                             {data.warnings.map((warning, index) => (

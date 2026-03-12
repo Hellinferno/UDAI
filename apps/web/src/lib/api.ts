@@ -1,10 +1,12 @@
 import axios from 'axios';
 
-const API_BASE_URL = 'http://127.0.0.1:8000/api/v1';
+const rawApiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
+const API_BASE_URL = rawApiBase && rawApiBase.length > 0 ? rawApiBase.replace(/\/$/, '') : '/api/v1';
 
 const api = axios.create({
     baseURL: API_BASE_URL,
     headers: { 'Content-Type': 'application/json' },
+    timeout: 30000,
 });
 
 // ─── Types ───
@@ -92,6 +94,18 @@ export interface ValuationResult {
     extraction_quality?: {
         mode: string;
         pipeline_stages?: string[];
+        checkpoint?: {
+            status: 'passed' | 'failed' | string;
+            summary?: string;
+            blocking_issues?: string[];
+            warnings?: string[];
+            checks?: Array<{
+                name: string;
+                passed: boolean;
+                details: string;
+                blocking: boolean;
+            }>;
+        };
         audit_trail?: Array<{
             field: string;
             confidence: number;

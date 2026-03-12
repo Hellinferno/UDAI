@@ -1,8 +1,12 @@
+import logging
 import uuid
 import time
 from typing import Dict, Any, List
 
 from store import store, AgentRun
+
+logger = logging.getLogger(__name__)
+
 
 class BaseAgent:
     def __init__(self, agent_type: str, task_name: str, deal_id: str, input_payload: Dict[str, Any]):
@@ -31,7 +35,7 @@ class BaseAgent:
             "type": step_type,
             "content": content
         })
-        print(f"[{self.agent_type}] {step_type.upper()}: {content}")
+        logger.debug("[%s] %s: %s", self.agent_type, step_type.upper(), content)
 
     def think(self, context: str):
         self._log_step("thought", context)

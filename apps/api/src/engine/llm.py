@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 
@@ -6,6 +7,9 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import OpenAI
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -36,40 +40,69 @@ nvidia_client = (
 )
 
 
+def _sanitize_error(err: Exception) -> str:
+    """Return a safe error description that cannot leak API keys or internal paths."""
+    msg = str(err)
+    # Redact any token/key-like sequences (40+ hex or base64 chars)
+    msg = re.sub(r"[A-Za-z0-9_\-]{40,}", "[REDACTED]", msg)
+    # Redact file system paths
+    msg = re.sub(r"[A-Za-z]:[/\\][^\s]+", "[PATH]", msg)
+    return msg[:300]
+
+
 def _is_quota_or_rate_limit_error(err: Exception) -> bool:
     msg = str(err).lower()
     return "resource_exhausted" in msg or "quota" in msg or "rate limit" in msg or "429" in msg
 
 
+def _is_transient_error(err: Exception) -> bool:
+    """Return True only for transient errors that are safe to retry (not quota/rate limit)."""
+    if _is_quota_or_rate_limit_error(err):
+        return False
+    msg = str(err).lower()
+    return any(x in msg for x in ["500", "502", "503", "504", "timeout", "connection", "unavailable", "internal"])
+
+
+@retry(
+    retry=retry_if_exception(_is_transient_error),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
+def _call_gemini(system_prompt: str, user_prompt: str) -> str:
+    """Call Gemini with automatic retry on transient errors (up to 3 attempts)."""
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=user_prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_prompt,
+            temperature=0.0,
+        ),
+    )
+    return response.text
+
+
 def ask_llm(system_prompt: str, user_prompt: str) -> str:
     """
     Submit prompt to Gemini as primary model.
-    If unavailable/fails, use NVIDIA fallback.
-    If no API keys are configured, use deterministic fallback.
+    Transient errors are retried up to 3x with exponential backoff via tenacity.
+    Quota/rate limit errors go straight to deterministic fallback.
+    If Gemini fails entirely, uses NVIDIA DeepSeek fallback.
     """
     if not GEMINI_API_KEY and not NVIDIA_API_KEY:
-        print("[LLM Engine] No API keys configured, using deterministic fallback")
+        logger.info("[LLM Engine] No API keys configured, using deterministic fallback")
         return _get_deterministic_fallback_response(user_prompt)
 
     try:
         if gemini_client:
-            response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=user_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_prompt,
-                    temperature=0.0,
-                ),
-            )
-            return response.text
+            return _call_gemini(system_prompt, user_prompt)
         raise Exception("Gemini API key not configured")
     except Exception as e_gemini:
         if _is_quota_or_rate_limit_error(e_gemini):
-            print(f"[LLM Engine Warning] Primary LLM quota/rate limit hit: {e_gemini}")
-            print("[LLM Engine] Skipping external fallback and using deterministic response")
+            logger.warning("[LLM Engine] Primary LLM quota/rate limit: %s", _sanitize_error(e_gemini))
             return _get_deterministic_fallback_response(user_prompt)
 
-        print(f"[LLM Engine Warning] Primary LLM Failed: {e_gemini}. Attempting fallback...")
+        logger.warning("[LLM Engine] Primary LLM failed: %s. Attempting fallback.", _sanitize_error(e_gemini))
 
         if nvidia_client:
             try:
@@ -88,9 +121,9 @@ def ask_llm(system_prompt: str, user_prompt: str) -> str:
                 )
                 return completion.choices[0].message.content
             except Exception as e_nvidia:
-                print(f"[LLM Engine Error] Fallback LLM also failed: {e_nvidia}")
+                logger.error("[LLM Engine] Fallback LLM also failed: %s", _sanitize_error(e_nvidia))
 
-        print("[LLM Engine] Using deterministic fallback response")
+        logger.warning("[LLM Engine] Using deterministic fallback response")
         return _get_deterministic_fallback_response(user_prompt)
 
 
@@ -317,6 +350,78 @@ def _build_infosys_fallback_profile() -> dict:
     }
 
 
+def _build_reliance_megacap_fallback_profile() -> dict:
+    """
+    Reliance Industries Limited – mega-cap diversified conglomerate, FY25 actuals.
+    Consolidated figures from RIL Annual Report FY2024-25.
+    Segments: O2C, Retail, Digital (Jio), Oil & Gas E&P.
+    This profile is used as a no-API fallback for RIL-related analysis.
+    """
+    total_borrowings    = 3_018_510_000_000    # ₹3,01,851 Cr gross borrowings
+    lease_liabilities   =   430_000_000_000    # ₹43,000 Cr (Ind AS 116)
+    cash_and_equivalents = 2_277_680_000_000   # ₹2,27,768 Cr (cash + current/non-current liquid investments)
+    net_debt = total_borrowings + lease_liabilities - cash_and_equivalents  # ~₹1,17,000 Cr net debt
+
+    # Public large-cap calibration: keep risk overlays minimal and use a debt mix
+    # aligned to an 85/15 equity-debt financing weight.
+    debt_weight = 0.15
+    equity_weight = 0.85
+    debt_to_equity = debt_weight / equity_weight
+
+    return {
+        "historical_revenues": [
+            8_149_580_000_000,   # FY2021A  ~₹8,14,958 Cr
+            9_269_700_000_000,   # FY2022A  ~₹9,26,970 Cr
+            9_208_810_000_000,   # FY2023A  ~₹9,20,881 Cr  (revised consolidated)
+            10_095_900_000_000,  # FY2024A  ~₹10,09,590 Cr
+            10_711_740_000_000,  # FY2025A  ~₹10,71,174 Cr
+        ],
+        "historical_ebitda_margins": [0.155, 0.162, 0.168, 0.171, 0.171],
+        "net_debt": net_debt,
+        "total_borrowings": total_borrowings,
+        "ccps_liability": 0,
+        "lease_liabilities": lease_liabilities,
+        "cash_and_equivalents": cash_and_equivalents,
+        "shares_outstanding": 6_766_000_000,    # ~676.6 Cr shares (post-bonus)
+        "diluted_shares_outstanding": 6_766_000_000,
+        "revenue_cagr_override": 0.065,          # 5-8% blended growth (Retail+Jio offset by O2C)
+        "cap_ex_percent_rev": 0.085,             # RIL is highly capital-intensive (~8-9% hist.)
+        "da_percent_rev": 0.050,                 # ~5% D&A
+        "debt_to_equity": debt_to_equity,
+        "beta": 1.00,
+        "risk_free_rate": 0.07,
+        "equity_risk_premium": 0.055,
+        "size_premium": 0.0,
+        "specific_risk_premium": 0.005,
+        "cost_of_debt": 0.09,
+        "profit_after_tax": 795_040_000_000,     # ~₹79,504 Cr PAT (FY25)
+        "basic_eps": 118.09,
+        "operating_cash_flow": 1_700_000_000_000, # ~₹1,70,000 Cr OCF
+        "industry_sector": "Diversified Conglomerate – Energy, Retail, Digital, O2C",
+        # Segment breakdown (FY25 approximate)
+        "segment_revenues": {
+            "O2C": 6_269_210_000_000,
+            "Retail": 3_309_430_000_000,
+            "Digital (Jio)": 1_541_190_000_000,
+            "Oil & Gas E&P": 252_110_000_000,
+        },
+        "segment_ebitda_margins": {
+            "O2C": 0.091,
+            "Retail": 0.079,
+            "Digital (Jio)": 0.460,
+            "Oil & Gas E&P": 0.825,
+        },
+        "base_fy": 2025,
+        "currency": "INR",
+        "company_legal_form": "public_limited",
+        "listing_status": "listed",
+        "cin": "L17110MH1973PLC019786",
+        "reporting_unit": "absolute",
+        "extraction_mode": "deterministic_fallback",
+        "fallback_profile": "reliance_industries_megacap_diversified",
+    }
+
+
 def _get_deterministic_fallback_response(user_prompt: str = "") -> str:
     """
     Returns deterministic JSON when LLM APIs are unavailable.
@@ -340,5 +445,17 @@ def _get_deterministic_fallback_response(user_prompt: str = "") -> str:
     )
     if infosys_pattern.search(prompt_l):
         return json.dumps(_build_infosys_fallback_profile())
+
+    # NOTE: Match RIL only when it appears in explicit target-company intent context.
+    # This avoids false positives from prompt template benchmark text that mentions
+    # "Reliance Industries" / "RIL" as examples for other companies.
+    ril_pattern = re.compile(
+        r"(?:target company is|company[:\s]+|data for|for|about|on|of)\s+"
+        r"(?:reliance\s+industries(?:\s+limited)?|ril)\b"
+        r"|\breliance\s+industries(?:\s+limited)?\b(?!\s*,\s*adani\s+group)"
+        r"|\bril\b.*?(?:o2c|jio\s+platforms|petrochemical)"
+    )
+    if ril_pattern.search(prompt_l):
+        return json.dumps(_build_reliance_megacap_fallback_profile())
 
     return json.dumps(_build_generic_fallback_profile())

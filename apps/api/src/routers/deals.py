@@ -43,7 +43,15 @@ async def create_deal(deal_data: DealCreate):
     )
 
 @router.get("", response_model=APIResponseList)
-async def list_deals(status_filter: str = "all", sort: str = "created_at_desc", limit: int = 20, offset: int = 0):
+async def list_deals(
+    status_filter: str = "all",
+    sort: str = "created_at_desc",
+    limit: int = 20,
+    offset: int = 0,
+):
+    # Clamp pagination parameters to safe bounds
+    limit = max(1, min(limit, 100))
+    offset = max(0, offset)
     all_deals = [d for d in store.deals.values() if not d.is_archived]
     
     # Filter by deal stage status

@@ -3,7 +3,15 @@ import { useNavigate } from 'react-router-dom'
 import { fetchDeals, createDeal, deleteDeal, type Deal, type DealCreatePayload } from '../lib/api'
 import { Plus, Search, Trash2, X, ChevronRight } from 'lucide-react'
 
-const DEAL_TYPES = ['M&A', 'IPO', 'LBO', 'Debt Raise', 'Equity Raise', 'Restructuring', 'Other']
+const DEAL_TYPES: { label: string; value: string }[] = [
+    { label: 'M&A',          value: 'ma' },
+    { label: 'IPO',          value: 'ipo' },
+    { label: 'LBO',          value: 'lbo' },
+    { label: 'Debt Raise',   value: 'debt_raise' },
+    { label: 'Equity Raise', value: 'equity_raise' },
+    { label: 'Restructuring',value: 'restructuring' },
+    { label: 'Other',        value: 'other' },
+]
 const INDUSTRIES = ['Technology', 'Healthcare', 'Financial Services', 'Consumer', 'Energy', 'Industrials', 'Real Estate', 'Telecom', 'Other']
 
 export default function Dashboard() {
@@ -13,9 +21,10 @@ export default function Dashboard() {
     const [search, setSearch] = useState('')
     const [showModal, setShowModal] = useState(false)
     const [form, setForm] = useState<DealCreatePayload>({
-        name: '', company_name: '', deal_type: 'M&A', industry: 'Technology', deal_stage: 'preliminary'
+        name: '', company_name: '', deal_type: 'ma', industry: 'Technology', deal_stage: 'preliminary'
     })
     const [creating, setCreating] = useState(false)
+    const [createError, setCreateError] = useState<string | null>(null)
 
     const load = useCallback(async () => {
         try {
@@ -33,12 +42,17 @@ export default function Dashboard() {
     const handleCreate = async () => {
         if (!form.name.trim() || !form.company_name.trim()) return
         setCreating(true)
+        setCreateError(null)
         try {
             const newDeal = await createDeal(form)
             setShowModal(false)
-            setForm({ name: '', company_name: '', deal_type: 'M&A', industry: 'Technology', deal_stage: 'preliminary' })
+            setForm({ name: '', company_name: '', deal_type: 'ma', industry: 'Technology', deal_stage: 'preliminary' })
+            setCreateError(null)
             navigate(`/deals/${newDeal.id}`)
-        } catch (err) {
+        } catch (err: unknown) {
+            const axErr = err as { response?: { data?: { detail?: string } }; message?: string }
+            const msg = axErr?.response?.data?.detail || axErr?.message || 'Failed to create deal'
+            setCreateError(typeof msg === 'string' ? msg : JSON.stringify(msg))
             console.error('Create deal failed', err)
         } finally {
             setCreating(false)
@@ -187,7 +201,7 @@ export default function Dashboard() {
                                     <label style={{ fontSize: 10, color: '#666', display: 'block', marginBottom: 5, letterSpacing: '0.08em', fontWeight: 700, textTransform: 'uppercase' }}>Type</label>
                                     <select className="input-field" value={form.deal_type}
                                         onChange={e => setForm(p => ({ ...p, deal_type: e.target.value }))}>
-                                        {DEAL_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                                        {DEAL_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
                                     </select>
                                 </div>
                                 <div>
@@ -207,11 +221,18 @@ export default function Dashboard() {
                             </div>
                         </div>
 
-                        <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 24, borderTop: '1px solid #222', paddingTop: 18 }}>
-                            <button className="btn-ghost" onClick={() => setShowModal(false)}>Cancel</button>
-                            <button className="btn-primary" onClick={handleCreate} disabled={creating || !form.name.trim() || !form.company_name.trim()}>
-                                {creating ? <><div className="spinner" style={{ width: 12, height: 12 }} /> Creating...</> : 'CREATE'}
-                            </button>
+                        <div style={{ marginTop: 24, borderTop: '1px solid #222', paddingTop: 18 }}>
+                            {createError && (
+                                <div style={{ color: '#ff4444', fontSize: 12, padding: '6px 10px', background: 'rgba(255,68,68,0.08)', border: '1px solid rgba(255,68,68,0.25)', borderRadius: 3, marginBottom: 12 }}>
+                                    {createError}
+                                </div>
+                            )}
+                            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+                                <button className="btn-ghost" onClick={() => { setShowModal(false); setCreateError(null) }}>Cancel</button>
+                                <button className="btn-primary" onClick={handleCreate} disabled={creating || !form.name.trim() || !form.company_name.trim()}>
+                                    {creating ? <><div className="spinner" style={{ width: 12, height: 12 }} /> Creating...</> : 'CREATE'}
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>

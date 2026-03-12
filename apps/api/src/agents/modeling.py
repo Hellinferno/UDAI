@@ -32,6 +32,12 @@ class FinancialModelingAgent(BaseAgent):
     # Helpers
     # ------------------------------------------------------------------
 
+    # Maximum characters per document fed into the LLM context.
+    # Annual reports have financials in the back half, so we keep the tail.
+    # ~400 K chars ≈ 100 K tokens — well within Gemini 2.5 Flash's 1 M limit
+    # while also fitting the NVIDIA DeepSeek 128 K-token fallback (per doc).
+    _MAX_DOC_CHARS = 400_000
+
     def _extract_document_context(self) -> str:
         docs = store.get_documents_for_deal(self.deal_id)
         if not docs:
@@ -39,7 +45,15 @@ class FinancialModelingAgent(BaseAgent):
         context = ""
         for doc in docs:
             context += f"\n--- Document: {doc.filename} ---\n"
-            context += doc.parsed_text if doc.parsed_text else "(Parsing incomplete or text unavailable)"
+            if doc.parsed_text:
+                text = doc.parsed_text
+                if len(text) > self._MAX_DOC_CHARS:
+                    # Keep the last _MAX_DOC_CHARS: financial statements live at
+                    # the back of Indian annual reports (Ind AS format).
+                    text = f"[...{len(text) - self._MAX_DOC_CHARS:,} chars omitted for length...]\n" + text[-self._MAX_DOC_CHARS:]
+                context += text
+            else:
+                context += "(Parsing incomplete or text unavailable)"
         return context
 
     def _resolve(
@@ -439,27 +453,41 @@ class FinancialModelingAgent(BaseAgent):
     @staticmethod
     def _infer_public_company_risk_overlay(industry: str, margins: list) -> dict:
         industry_blob = (industry or "").lower()
-        high_beta_markers = (
-            "fintech",
-            "payments",
-            "digital",
-            "internet",
-            "technology",
-            "software",
-            "platform",
-            "e-commerce",
-            "ecommerce",
-            "marketplace",
-            "consumer internet",
-            "saas",
-        )
+
+        # --- Sector marker groups (classification priority: highest → lowest) ---
         it_services_markers = (
-            "it services",
-            "it consulting",
-            "information technology",
-            "technology services",
-            "software services",
-            "systems integration",
+            "it services", "it consulting", "information technology",
+            "technology services", "software services", "systems integration",
+        )
+        energy_markers = (
+            "oil", "gas", "petroleum", "refinery", "refining", "o2c",
+            "hydrocarbon", "petrochemical", "upstream", "downstream",
+            "lng", "lpg", "energy",
+        )
+        telecom_markers = (
+            "telecom", "telecommunications", "mobile network",
+            "wireless", "broadband", "cellular", "spectrum",
+        )
+        conglomerate_markers = (
+            "conglomerate", "diversified", "holding company",
+            "group of companies", "multi-sector", "multi segment",
+        )
+        manufacturing_markers = (
+            "manufacturing", "industrial", "steel", "cement", "auto",
+            "automobile", "chemicals", "specialty chemicals", "mining",
+            "infrastructure", "power generation", "power transmission",
+            "renewable energy", "engineering",
+        )
+        consumer_stable_markers = (
+            "fmcg", "consumer staples", "staples", "food", "beverages",
+            "tobacco", "household products", "pharma", "pharmaceutical",
+            "healthcare", "hospital", "diagnostics", "retail",
+        )
+        # High-beta digital: only when NO stable/large-cap sector is present
+        high_beta_markers = (
+            "fintech", "payments", "digital", "internet", "technology",
+            "software", "platform", "e-commerce", "ecommerce", "marketplace",
+            "consumer internet", "saas",
         )
 
         latest_margin = margins[-1] if margins else 0.0
@@ -473,25 +501,56 @@ class FinancialModelingAgent(BaseAgent):
         min_projection_years = 5
         reasons = []
 
-        # IT services companies get higher terminal growth and longer forecast
-        is_it_services = any(marker in industry_blob for marker in it_services_markers)
+        is_it_services   = any(m in industry_blob for m in it_services_markers)
+        is_energy        = any(m in industry_blob for m in energy_markers)
+        is_telecom       = any(m in industry_blob for m in telecom_markers)
+        is_conglomerate  = any(m in industry_blob for m in conglomerate_markers)
+        is_manufacturing = any(m in industry_blob for m in manufacturing_markers)
+        is_consumer      = any(m in industry_blob for m in consumer_stable_markers)
+        # High-beta only fires when no stable large-cap sector is identified
+        is_stable_sector = is_it_services or is_energy or is_telecom or is_conglomerate or is_manufacturing or is_consumer
+        is_high_beta     = (not is_stable_sector) and any(m in industry_blob for m in high_beta_markers)
+
         if is_it_services:
             beta_floor = max(beta_floor, 0.85)
             terminal_exit_multiple = max(terminal_exit_multiple, 18.0)
-            terminal_growth_premium = 0.005  # +0.5% terminal growth for IT
+            terminal_growth_premium = 0.005          # +0.5% for IT recurring revenue
             min_projection_years = max(min_projection_years, 7)
-            reasons.append("IT services sector overlay: higher terminal growth, longer forecast")
-        elif any(marker in industry_blob for marker in high_beta_markers):
+            reasons.append("IT services sector: 18x exit multiple, +0.5% TGR premium, 7-yr forecast")
+        elif is_energy:
+            beta_floor = max(beta_floor, 1.00)
+            terminal_exit_multiple = max(terminal_exit_multiple, 10.0)
+            reasons.append("energy/O2C sector: beta ~1.0, 10x terminal multiple, no size/specific premium")
+        elif is_telecom:
+            beta_floor = max(beta_floor, 0.90)
+            terminal_exit_multiple = max(terminal_exit_multiple, 10.0)
+            terminal_growth_premium = 0.003          # +0.3% for telecom subscriber growth
+            reasons.append("telecom sector: defensive beta, 10x terminal multiple, no size/specific premium")
+        elif is_conglomerate:
+            beta_floor = max(beta_floor, 1.00)
+            terminal_exit_multiple = max(terminal_exit_multiple, 11.0)
+            reasons.append("diversified conglomerate: market beta ~1.0, 11x terminal multiple")
+        elif is_manufacturing:
+            beta_floor = max(beta_floor, 1.00)
+            terminal_exit_multiple = max(terminal_exit_multiple, 10.0)
+            reasons.append("manufacturing/industrial sector: beta ~1.0, 10x terminal multiple")
+        elif is_consumer:
+            beta_floor = max(beta_floor, 0.90)
+            terminal_exit_multiple = max(terminal_exit_multiple, 13.0)
+            reasons.append("consumer staples/pharma/retail sector: defensive beta, 13x multiple")
+        elif is_high_beta:
             beta_floor = max(beta_floor, 1.30)
             size_premium = max(size_premium, 0.02)
             specific_risk_premium = max(specific_risk_premium, 0.03)
             terminal_exit_multiple = max(terminal_exit_multiple, 15.0)
-            reasons.append("sector risk overlay for high-beta digital business model")
+            reasons.append("high-beta digital/fintech sector: elevated risk premiums, 15x exit multiple")
 
+        # Loss-making overlay — size/specific premiums suppressed for known stable sectors
         if latest_margin < 0 or avg_margin < 0:
             beta_floor = max(beta_floor, 1.25)
-            size_premium = max(size_premium, 0.02)
-            specific_risk_premium = max(specific_risk_premium, 0.03)
+            if not is_stable_sector:
+                size_premium = max(size_premium, 0.02)
+                specific_risk_premium = max(specific_risk_premium, 0.03)
             min_projection_years = max(min_projection_years, 7)
             reasons.append("turnaround overlay for loss-making operating profile")
 
@@ -624,6 +683,165 @@ class FinancialModelingAgent(BaseAgent):
             "If a value is not found with citation, return null and explain briefly in reconciliation_log.\n"
             "Do not fabricate values.\n"
         )
+
+    @classmethod
+    def _build_extraction_checkpoint(
+        cls,
+        llm_data: dict,
+        audit_trail: list,
+        auditor_status: str,
+        triangulation_result: dict,
+        has_uploaded_documents: bool,
+        fallback_mode: bool,
+        company_context: dict,
+    ) -> dict:
+        """Validate whether extracted inputs are complete and internally consistent."""
+        issues = []
+        warnings = []
+        checks = []
+
+        def _add_check(name: str, passed: bool, details: str, blocking: bool = False):
+            checks.append(
+                {
+                    "name": name,
+                    "passed": passed,
+                    "details": details,
+                    "blocking": blocking,
+                }
+            )
+            if not passed:
+                if blocking:
+                    issues.append(f"{name}: {details}")
+                else:
+                    warnings.append(f"{name}: {details}")
+
+        revenues = llm_data.get("historical_revenues")
+        margins = llm_data.get("historical_ebitda_margins")
+        borrowings = cls._to_number(llm_data.get("total_borrowings"))
+        lease_liabilities = cls._to_number(llm_data.get("lease_liabilities")) or 0.0
+        ccps_liability = cls._to_number(llm_data.get("ccps_liability")) or 0.0
+        cash = cls._to_number(llm_data.get("cash_and_equivalents"))
+        net_debt = cls._to_number(llm_data.get("net_debt"))
+
+        has_core_revenues = (
+            isinstance(revenues, list)
+            and len(revenues) >= 3
+            and all(isinstance(v, (int, float)) and v > 0 for v in revenues)
+        )
+        _add_check(
+            "historical_revenues",
+            has_core_revenues,
+            "Expected at least 3 positive annual revenue values.",
+            blocking=has_uploaded_documents,
+        )
+
+        has_core_margins = (
+            isinstance(margins, list)
+            and len(margins) >= 3
+            and all(isinstance(v, (int, float)) and -1.0 < v < 1.0 for v in margins)
+        )
+        _add_check(
+            "historical_ebitda_margins",
+            has_core_margins,
+            "Expected at least 3 EBITDA margins in decimal form between -1 and 1.",
+            blocking=has_uploaded_documents,
+        )
+
+        has_debt_cash = borrowings is not None and cash is not None
+        _add_check(
+            "debt_and_cash_fields",
+            has_debt_cash,
+            "Both total_borrowings and cash_and_equivalents should be extracted.",
+            blocking=has_uploaded_documents,
+        )
+
+        strong_fields = {
+            "historical_revenues": cls._field_has_strong_support("historical_revenues", audit_trail, min_confidence=0.70),
+            "historical_ebitda_margins": cls._field_has_strong_support("historical_ebitda_margins", audit_trail, min_confidence=0.70),
+            "total_borrowings": cls._field_has_strong_support("total_borrowings", audit_trail, min_confidence=0.65),
+            "cash_and_equivalents": cls._field_has_strong_support("cash_and_equivalents", audit_trail, min_confidence=0.65),
+        }
+        enough_strong_support = sum(1 for ok in strong_fields.values() if ok) >= 2
+        _add_check(
+            "source_confidence",
+            enough_strong_support,
+            "Too few core fields have strong citation support.",
+            blocking=has_uploaded_documents,
+        )
+
+        if has_debt_cash and net_debt is not None:
+            derived_net_debt = (borrowings or 0.0) + lease_liabilities + ccps_liability - (cash or 0.0)
+            delta = abs(derived_net_debt - net_debt)
+            tolerance = max(abs(derived_net_debt) * 0.10, 50_000_000.0)
+            _add_check(
+                "net_debt_reconciliation",
+                delta <= tolerance,
+                f"net_debt mismatch vs derived debt-cash bridge (delta={delta:,.0f}, tolerance={tolerance:,.0f}).",
+                blocking=has_uploaded_documents,
+            )
+        else:
+            _add_check(
+                "net_debt_reconciliation",
+                False,
+                "Could not run net-debt reconciliation due to missing fields.",
+                blocking=has_uploaded_documents,
+            )
+
+        if isinstance(revenues, list) and len(revenues) >= 2 and all(isinstance(v, (int, float)) and v > 0 for v in revenues):
+            rounded = {round(v, -7) for v in revenues}
+            _add_check(
+                "revenue_variability",
+                len(rounded) > 1,
+                "Extracted revenues appear flat/duplicated across years.",
+                blocking=has_uploaded_documents,
+            )
+
+        tri_verdict = str(triangulation_result.get("overall_verdict") or "unknown").lower()
+        _add_check(
+            "triangulation",
+            tri_verdict != "halt",
+            f"Triangulation verdict is {tri_verdict}.",
+            blocking=has_uploaded_documents,
+        )
+
+        _add_check(
+            "auditor",
+            str(auditor_status or "").lower() != "rejected",
+            f"Auditor status is {auditor_status or 'unknown'}.",
+            blocking=has_uploaded_documents,
+        )
+
+        if has_uploaded_documents and fallback_mode:
+            _add_check(
+                "fallback_mode",
+                False,
+                "Deterministic fallback was used instead of direct extraction from documents.",
+                blocking=True,
+            )
+
+        is_private = bool(company_context.get("is_private_company")) if isinstance(company_context, dict) else False
+        shares = cls._to_number(llm_data.get("shares_outstanding"))
+        diluted = cls._to_number(llm_data.get("diluted_shares_outstanding"))
+        if not is_private:
+            _add_check(
+                "share_count_presence",
+                (shares is not None) or (diluted is not None),
+                "Public company context should have shares_outstanding or diluted_shares_outstanding.",
+                blocking=False,
+            )
+
+        status = "passed" if not issues else "failed"
+        return {
+            "status": status,
+            "blocking_issues": issues,
+            "warnings": warnings,
+            "checks": checks,
+            "summary": (
+                "Extraction checkpoint passed."
+                if status == "passed"
+                else "Extraction checkpoint failed due to blocking data quality issues."
+            ),
+        }
 
     @staticmethod
     def _build_synthesis_summary(
@@ -923,6 +1141,32 @@ class FinancialModelingAgent(BaseAgent):
         else:
             self.observe("Skipping triangulation because there is no extracted data.")
 
+        extraction_checkpoint = self._build_extraction_checkpoint(
+            llm_data=llm_data,
+            audit_trail=extraction_audit_trail,
+            auditor_status=auditor_status,
+            triangulation_result=triangulation_result,
+            has_uploaded_documents=has_uploaded_documents,
+            fallback_mode=fallback_mode,
+            company_context=company_context,
+        )
+        self.observe(
+            "Extraction checkpoint "
+            + extraction_checkpoint.get("status", "unknown")
+            + f" with {len(extraction_checkpoint.get('blocking_issues', []))} blocking issues."
+        )
+
+        if extraction_checkpoint.get("status") == "failed" and has_uploaded_documents:
+            run_record = store.agent_runs.get(self.run_id)
+            if run_record:
+                run_record.input_payload["extraction_checkpoint"] = extraction_checkpoint
+            issue_summary = "; ".join(extraction_checkpoint.get("blocking_issues", [])[:4])
+            self.fail(
+                "Extraction checkpoint failed. Required values from documents are incomplete or inconsistent. "
+                + issue_summary
+            )
+            return self.run_id
+
         audit_records = []
         for entry in extraction_audit_trail:
             field_name = entry.get("field", "unknown")
@@ -1035,7 +1279,8 @@ class FinancialModelingAgent(BaseAgent):
         self.act("python_exec", "Instantiating DCFEngine and calculating WACC and UFCF")
         try:
             is_private_company = company_context["is_private_company"]
-            terminal_growth_rate = params.get("terminal_growth_rate", 0.025)
+            # Default: 3.0% aligns to India long-run nominal GDP growth (was 2.5%)
+            terminal_growth_rate = params.get("terminal_growth_rate", 0.030)
 
             terminal_growth_reference = self._to_number(llm_data.get("terminal_growth_reference"))
             if (
@@ -1050,6 +1295,39 @@ class FinancialModelingAgent(BaseAgent):
                 )
 
             risk_overlay = self._infer_public_company_risk_overlay(deal_industry, historical_ebitda_margins)
+
+            # Supplement sector detection with LLM-extracted industry when deal metadata is absent
+            if not deal_industry:
+                llm_industry = str(llm_data.get("industry_sector", "")).strip()
+                if llm_industry:
+                    risk_overlay = self._infer_public_company_risk_overlay(llm_industry, historical_ebitda_margins)
+                    self.observe(f"Using LLM-extracted industry '{llm_industry}' for risk overlay (deal metadata empty).")
+
+            # ── Large-cap revenue guard ────────────────────────────────────────────────
+            # Companies with consolidated revenue ≥ ₹50,000 Crore are exchange-traded
+            # large-caps.  Size premiums / high specific-risk premiums are only meant for
+            # small / illiquid stocks.  Zero them out here regardless of sector overlay.
+            if historical_revenues:
+                _max_rev = max(historical_revenues)
+                if _max_rev >= 500_000_000_000:   # ≥ ₹50,000 Crore (₹5×10^11 absolute)
+                    _had_premium = (
+                        risk_overlay.get("size_premium", 0) > 0
+                        or risk_overlay.get("specific_risk_premium", 0) > 0
+                        or risk_overlay.get("beta_floor", 1.0) > 1.10
+                    )
+                    if _had_premium:
+                        risk_overlay = dict(risk_overlay)
+                        risk_overlay["size_premium"] = 0.0
+                        risk_overlay["specific_risk_premium"] = 0.0
+                        risk_overlay["beta_floor"] = min(risk_overlay["beta_floor"], 1.05)
+                        risk_overlay["reasons"] = list(risk_overlay.get("reasons", [])) + [
+                            f"large-cap guard (rev ₹{_max_rev/1e7:,.0f} Cr ≥ ₹50,000 Cr): "
+                            "size & specific premiums zeroed, beta floor capped at 1.05"
+                        ]
+                        self.observe(
+                            f"Large-cap revenue guard: ₹{_max_rev/1e7:,.0f} Cr → "
+                            "zeroed size/specific premiums, beta_floor ≤ 1.05."
+                        )
 
             # Apply industry-aware terminal growth premium (e.g. IT services get +0.5%)
             tgr_premium = risk_overlay.get("terminal_growth_premium", 0.0)
@@ -1241,7 +1519,28 @@ class FinancialModelingAgent(BaseAgent):
                 label="cap_ex_percent_rev",
             )
             data_sources.append(source)
-            cap_ex_percent_rev = cap_ex_percent_rev if cap_ex_percent_rev is not None else 0.03
+            if cap_ex_percent_rev is None:
+                # Sector-aware CapEx default:
+                #  - Capital-intensive sectors (energy, refinery, telecom, manufacturing, infra):
+                #    historically 8–12 % of revenue.
+                #  - Asset-light / unknown: 3 % generic fallback.
+                _ind_str = " ".join(filter(None, [
+                    deal_industry,
+                    str(llm_data.get("industry_sector", "")),
+                ])).lower()
+                _capital_intensive_markers = (
+                    "energy", "oil", "gas", "refinery", "refining", "petrochemical",
+                    "o2c", "telecom", "telecommunications", "manufacturing", "industrial",
+                    "infrastructure", "power", "mining", "steel", "cement",
+                    "chemicals", "automotive", "automobile", "engineering",
+                )
+                _is_capital_intensive = any(m in _ind_str for m in _capital_intensive_markers)
+                if _is_capital_intensive:
+                    cap_ex_percent_rev = 0.09
+                    data_sources.append("cap_ex_percent_rev: 9% sector default (capital-intensive)")
+                else:
+                    cap_ex_percent_rev = 0.03
+                    data_sources.append("cap_ex_percent_rev: 3% generic default")
 
             revenue_cagr_override, source = self._resolve(
                 "revenue_cagr_override",
@@ -1268,7 +1567,18 @@ class FinancialModelingAgent(BaseAgent):
                 revenue_cagr_override = params["revenue_cagr_override_auto"]
                 data_sources.append(f"revenue_cagr_override: auto-capped to {revenue_cagr_override * 100:.1f}%")
 
-            nwc_percent_rev = float(params.get("nwc_percent_rev") or 0.10)
+            # NWC: large-cap companies run leaner working capital as % of revenue.
+            # ≥ ₹50,000 Cr revenue → 5%; smaller companies → 10% generic default.
+            if params.get("nwc_percent_rev"):
+                nwc_percent_rev = float(params["nwc_percent_rev"])
+            else:
+                _max_rev_nwc = max(historical_revenues) if historical_revenues else 0
+                if _max_rev_nwc >= 500_000_000_000:    # ≥ ₹50,000 Crore
+                    nwc_percent_rev = 0.05
+                    data_sources.append("nwc_percent_rev: 5% (large-cap ≥ ₹50,000 Cr)")
+                else:
+                    nwc_percent_rev = 0.10
+                    data_sources.append("nwc_percent_rev: 10% generic default")
 
             base_fy, source = self._resolve("base_fy", params, llm_data, generic_defaults, cast=int, label="base_fy")
             data_sources.append(source)
@@ -1665,6 +1975,7 @@ class FinancialModelingAgent(BaseAgent):
                     "per_share_value_available": shares_for_valuation is not None and not is_private_company,
                     "tax_loss_carryforward_modeled": tax_loss_carryforward > 0,
                 },
+                "checkpoint": extraction_checkpoint,
             }
 
             warnings = list(valuation_data.get("warnings", []))

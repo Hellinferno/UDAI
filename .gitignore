@@ -1,3 +1,24 @@
 # IDE settings
 .vscode/
 .idea/
+
+# Python caches and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime logs
+*.log
+logs/
+
+# Generated uploads and outputs
+apps/data/uploads/
+apps/data/outputs/
+apps/api/test_outputs/
+test_outputs/
+aibaa/data/outputs/
+apps/api/aibaa/data/outputs/
+
+# Frontend build artifacts
+dist/
+build/

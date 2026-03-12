@@ -1,23 +1,17 @@
 import uuid
-import os
-from typing import Dict, Any, List
+from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
 
 from store import store
+from models import APIResponse, Meta
 
-# Two routers here: one for Deal-specific outputs, one for direct Output downloads
+# Resolve the base output directory; FileResponse paths are validated against it.
+_OUTPUT_BASE = Path(__file__).resolve().parent.parent.parent.parent / "data" / "outputs"
+
+# Two routers: one for deal-scoped output listing, one for direct download.
 deal_router = APIRouter(prefix="/deals", tags=["Outputs"])
 output_router = APIRouter(prefix="/outputs", tags=["Outputs"])
-
-class Meta(BaseModel):
-    request_id: str
-
-class APIResponse(BaseModel):
-    success: bool
-    data: Any
-    meta: Meta
 
 @deal_router.get("/{deal_id}/outputs", response_model=APIResponse)
 async def list_deal_outputs(deal_id: str):
@@ -50,12 +44,28 @@ async def download_output(output_id: str):
     output_record = store.outputs.get(output_id)
     if not output_record:
         raise HTTPException(status_code=404, detail="Output not found")
-        
-    if not os.path.exists(output_record.storage_path):
+
+    file_path = Path(output_record.storage_path).resolve()
+
+    # Guard against path-traversal: only serve files within allowed output roots.
+    upload_base = Path(__file__).resolve().parent.parent.parent.parent / "data" / "uploads"
+    allowed_roots = (_OUTPUT_BASE.resolve(), upload_base.resolve())
+    # Use Path.is_relative_to-style check via str comparison with trailing sep to
+    # prevent prefix-collision attacks (e.g. /data/outputs-evil).
+    def _within(fp: Path, root: Path) -> bool:
+        try:
+            fp.relative_to(root)
+            return True
+        except ValueError:
+            return False
+    if not any(_within(file_path, root) for root in allowed_roots):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    if not file_path.exists():
         raise HTTPException(status_code=404, detail="Physical file missing from disk")
-        
+
     return FileResponse(
-        path=output_record.storage_path,
+        path=str(file_path),
         filename=output_record.filename,
-        media_type='application/octet-stream'
+        media_type="application/octet-stream",
     )

@@ -1,7 +1,12 @@
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 import uuid
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
 
 @dataclass
 class Output:
@@ -14,7 +19,7 @@ class Output:
     review_status: str = "draft"
     version: int = 1
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utcnow)
 
 @dataclass
 class ExtractionAudit:
@@ -33,7 +38,7 @@ class ExtractionAudit:
     triangulation_details: str = ""
     user_override: Any = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utcnow)
 
 @dataclass
 class Task:
@@ -44,7 +49,7 @@ class Task:
     deal_id: str = ""
     is_ai_generated: bool = True
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utcnow)
 
 @dataclass
 class AgentRun:
@@ -57,7 +62,7 @@ class AgentRun:
     confidence_score: Optional[float] = None
     error_message: Optional[str] = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utcnow)
 
 @dataclass
 class Document:
@@ -70,7 +75,7 @@ class Document:
     parsed_text: Optional[str] = None
     parse_status: str = "pending"
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    uploaded_at: datetime = field(default_factory=datetime.now)
+    uploaded_at: datetime = field(default_factory=_utcnow)
 
 @dataclass
 class Deal:
@@ -81,10 +86,13 @@ class Deal:
     deal_stage: str = "preliminary"
     notes: Optional[str] = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.now)
+    created_at: datetime = field(default_factory=_utcnow)
     is_archived: bool = False
 
-# --- Global In-Memory Store ---
+
+# ---------------------------------------------------------------------------
+# Global In-Memory Store
+# ---------------------------------------------------------------------------
 
 class MemoryStore:
     def __init__(self):
@@ -96,21 +104,14 @@ class MemoryStore:
         self.extraction_audits: Dict[str, List[ExtractionAudit]] = {}
 
     def get_deal(self, deal_id: str) -> Optional[Deal]:
-        target = self.deals.get(deal_id)
-        if target and not target.is_archived:
-            return target
-            
-        # Development hot-reload fallback: Auto-resurrect the deal
-        # if the user is still on the deal page but the backend store was wiped
-        if not target and deal_id:
-            recovered_deal = Deal(id=deal_id, name="Recovered Pipeline (Hot Reload)", company_name="Auto-Restored")
-            self.deals[deal_id] = recovered_deal
-            return recovered_deal
-            
+        deal = self.deals.get(deal_id)
+        if deal and not deal.is_archived:
+            return deal
         return None
-    
+
     def get_documents_for_deal(self, deal_id: str) -> List[Document]:
         return [doc for doc in self.documents.values() if doc.deal_id == deal_id]
+
 
 # Singleton instance
 store = MemoryStore()
