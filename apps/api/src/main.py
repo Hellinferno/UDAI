@@ -18,9 +18,11 @@ from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic_settings import BaseSettings
 
-from routers import deals, documents, agents, outputs
-from database import engine, Base
-import db_models
+import db_models  # noqa: F401 - ensure ORM models are registered
+from database import Base, SessionLocal, engine
+from db_models import DealModel, DocumentModel
+from persistence import hydrate_store_from_db, sync_deal_to_store, sync_document_to_store
+from routers import agents, auth, deals, documents, outputs
 
 # Ensure database tables are created synchronously on startup
 Base.metadata.create_all(bind=engine)
@@ -83,6 +85,7 @@ app.include_router(documents.router, prefix="/api/v1")
 app.include_router(agents.router, prefix="/api/v1")
 app.include_router(outputs.deal_router, prefix="/api/v1")
 app.include_router(outputs.output_router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api/v1")
 
 
 @app.get("/api/v1/health", tags=["Health"])
@@ -114,6 +117,16 @@ def _parse_in_thread(doc_id: str) -> None:
     doc.parsed_text = text
     doc.parse_status = "parsed" if text else "parse_failed"
 
+    db = SessionLocal()
+    try:
+        db_doc = db.query(DocumentModel).filter(DocumentModel.id == doc_id).first()
+        if db_doc:
+            db_doc.parsed_text = text
+            db_doc.parse_status = doc.parse_status
+            db.commit()
+    finally:
+        db.close()
+
 
 @app.on_event("startup")
 async def _recover_uploads() -> None:
@@ -126,7 +139,12 @@ async def _recover_uploads() -> None:
     from store import store
     from store import Deal, Document
 
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    hydrate_store_from_db(db)
+
     if not _UPLOAD_BASE.exists():
+        db.close()
         return
 
     loop = asyncio.get_event_loop()
@@ -140,12 +158,18 @@ async def _recover_uploads() -> None:
             continue
 
         # Recover deal stub if not already present.
-        if deal_id not in store.deals:
-            store.deals[deal_id] = Deal(
+        db_deal = db.query(DealModel).filter(DealModel.id == deal_id).first()
+        if db_deal is None:
+            db_deal = DealModel(
                 id=deal_id,
+                tenant_id="org_cyberbank",
+                owner_id="system_recovery",
                 name=f"Recovered Deal ({deal_id[:8]})",
                 company_name="(Restored from disk)",
             )
+            db.add(db_deal)
+            db.flush()
+        sync_deal_to_store(db_deal)
 
         for fpath in deal_dir.iterdir():
             if not fpath.is_file():
@@ -160,20 +184,24 @@ async def _recover_uploads() -> None:
             file_id = maybe_id if _UUID_RE.match(maybe_id) else str(uuid.uuid4())
             original_name = name_part[len(maybe_id) + 1:] if _UUID_RE.match(maybe_id) else name_part
 
-            if file_id in store.documents:
-                continue  # already registered (e.g. just uploaded this session)
-
-            doc = Document(
-                id=file_id,
-                deal_id=deal_id,
-                filename=original_name,
-                file_type=ext,
-                file_size_bytes=fpath.stat().st_size,
-                storage_path=str(fpath),
-                parse_status="pending",
-            )
-            store.documents[file_id] = doc
+            db_doc = db.query(DocumentModel).filter(DocumentModel.id == file_id).first()
+            if db_doc is None:
+                db_doc = DocumentModel(
+                    id=file_id,
+                    deal_id=deal_id,
+                    filename=original_name,
+                    file_type=ext,
+                    file_size_bytes=fpath.stat().st_size,
+                    storage_path=str(fpath),
+                    parse_status="pending",
+                )
+                db.add(db_doc)
+                db.flush()
+            sync_document_to_store(db_doc)
             to_parse.append(file_id)
+
+    db.commit()
+    db.close()
 
     # Fire off parsing in the background — don't await so startup completes fast.
     for doc_id in to_parse:

@@ -5,8 +5,8 @@ import uuid
 
 # We keep the Pydantic/dataclasses strictly for type hints where agents expect them.
 # The store will now act as a facade over DB.
-from database import SessionLocal
-from db_models import DealModel, DocumentModel, AgentRunModel, OutputModel, ExtractionAuditModel, TaskModel
+from database import SessionLocal, ensure_database_ready
+from db_models import DealModel, DocumentModel, AgentRunModel, OutputModel, TaskModel
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -87,6 +87,8 @@ class Deal:
     industry: str = ""
     deal_stage: str = "preliminary"
     notes: Optional[str] = None
+    tenant_id: Optional[str] = None
+    owner_id: Optional[str] = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
     created_at: datetime = field(default_factory=_utcnow)
     is_archived: bool = False
@@ -116,8 +118,9 @@ class DictFacade:
         return self.model_class(**d)
 
     def get(self, key, default=None):
+        ensure_database_ready()
         with SessionLocal() as db:
-            obj = db.query(self.model_class).get(key)
+            obj = db.get(self.model_class, key)
             return self._to_dataclass(obj) if obj else default
 
     def __getitem__(self, key):
@@ -126,9 +129,10 @@ class DictFacade:
         return res
 
     def __setitem__(self, key, value):
+        ensure_database_ready()
         with SessionLocal() as db:
             # Check if exists
-            obj = db.query(self.model_class).get(key)
+            obj = db.get(self.model_class, key)
             if obj:
                 for k, v in vars(value).items():
                     if hasattr(obj, k):
@@ -138,8 +142,9 @@ class DictFacade:
             db.commit()
 
     def __delitem__(self, key):
+        ensure_database_ready()
         with SessionLocal() as db:
-            obj = db.query(self.model_class).get(key)
+            obj = db.get(self.model_class, key)
             if obj:
                 db.delete(obj)
                 db.commit()
@@ -147,18 +152,29 @@ class DictFacade:
                 raise KeyError(key)
 
     def __contains__(self, key):
+        ensure_database_ready()
         with SessionLocal() as db:
-            return db.query(self.model_class).get(key) is not None
+            return db.get(self.model_class, key) is not None
 
     def values(self):
+        ensure_database_ready()
         with SessionLocal() as db:
             objs = db.query(self.model_class).all()
             return [self._to_dataclass(o) for o in objs]
 
     def clear(self):
+        ensure_database_ready()
         with SessionLocal() as db:
             db.query(self.model_class).delete()
             db.commit()
+
+    def pop(self, key, default=None):
+        try:
+            value = self[key]
+        except KeyError:
+            return default
+        del self[key]
+        return value
 
 class MemoryStore:
     def __init__(self):
@@ -167,7 +183,8 @@ class MemoryStore:
         self.agent_runs = DictFacade(AgentRunModel, AgentRun)
         self.outputs = DictFacade(OutputModel, Output)
         self.tasks = DictFacade(TaskModel, Task)
-        self.extraction_audits = DictFacade(ExtractionAuditModel, ExtractionAudit)
+        # Extraction audits are accessed as run_id -> [ExtractionAudit, ...] during a run.
+        self.extraction_audits: Dict[str, List[ExtractionAudit]] = {}
 
     def get_deal(self, deal_id: str) -> Optional[Deal]:
         deal = self.deals.get(deal_id)

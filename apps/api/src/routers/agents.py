@@ -1,18 +1,30 @@
-import uuid
 import logging
-from typing import Dict, Any
-from fastapi import APIRouter, HTTPException, Depends
-from sqlalchemy.orm import Session
-from pydantic import BaseModel, Field
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict
 
-from db_models import DealModel, DocumentModel, AgentRunModel
-from dependencies import get_db, get_current_user
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from db_models import AgentRunModel, DealModel, DocumentModel
+from dependencies import get_current_user, get_db
 from models import APIResponse, Meta
+from persistence import (
+    get_deal_for_user,
+    persist_run_bundle,
+    sync_deal_to_store,
+    sync_document_to_store,
+)
+from store import store
 from agents.orchestrator import OrchestratorAgent
 from agents.modeling import FinancialModelingAgent
+from database import SessionLocal
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/deals", tags=["Agents"])
+
+_agent_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="agent_run")
 
 
 class AgentRunPayload(BaseModel):
@@ -20,40 +32,91 @@ class AgentRunPayload(BaseModel):
     task_name: str = Field(..., min_length=1, max_length=80)
     parameters: Dict[str, Any] = Field(default_factory=dict)
 
-@router.post("/{deal_id}/agents/run", response_model=APIResponse)
+
+def _sanitize_reasoning_steps(steps: list[dict]) -> list[dict]:
+    safe_steps = []
+    for step in steps or []:
+        safe_steps.append({
+            "step": step.get("step"),
+            "type": step.get("type"),
+        })
+    return safe_steps
+
+
+def _serialize_run(run_record) -> dict:
+    return {
+        "run_id": run_record.id,
+        "status": run_record.status,
+        "steps": _sanitize_reasoning_steps(run_record.reasoning_steps),
+        "valuation_result": run_record.input_payload.get("valuation_result"),
+        "error_message": run_record.error_message,
+        "confidence_score": run_record.confidence_score,
+    }
+
+
+def _execute_modeling_run(agent: FinancialModelingAgent) -> None:
+    db = SessionLocal()
+    try:
+        agent.run()
+        persist_run_bundle(db, agent.run_id)
+    except Exception:
+        logger.exception("Background agent execution failed for run %s", agent.run_id)
+        persist_run_bundle(db, agent.run_id)
+    finally:
+        db.close()
+
+
+def _ensure_documents_ready_for_run(db: Session, deal_id: str) -> None:
+    docs = (
+        db.query(DocumentModel)
+        .filter(DocumentModel.deal_id == deal_id)
+        .order_by(DocumentModel.uploaded_at.asc())
+        .all()
+    )
+    for doc in docs:
+        sync_document_to_store(doc)
+
+    blocked = [doc.filename for doc in docs if doc.parse_status != "parsed"]
+    if blocked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Documents are still being parsed or failed parsing. "
+                "Wait until all parse_status values are 'parsed' before running the agent. "
+                f"Blocked files: {', '.join(blocked[:5])}"
+            ),
+        )
+
+
+@router.post("/{deal_id}/agents/run", response_model=APIResponse, status_code=status.HTTP_202_ACCEPTED)
 async def dispatch_agent(
-    deal_id: str, 
+    deal_id: str,
     payload: AgentRunPayload,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    deal = db.query(DealModel).filter(
-        DealModel.id == deal_id,
-        DealModel.tenant_id == user["tenant_id"]
-    ).first()
+    deal = get_deal_for_user(db, deal_id, current_user["tenant_id"])
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-        
-    docs = db.query(DocumentModel).filter(DocumentModel.deal_id == deal_id).all()
-    if any(d.parse_status in ("pending", "parsing") for d in docs):
-        raise HTTPException(status_code=422, detail="Cannot run agent while documents are still processing.")
+
+    sync_deal_to_store(deal)
 
     try:
-        # Initialize the Orchestrator which acts as the main routing brain
         orchestrator = OrchestratorAgent(
             deal_id=deal_id,
-            input_payload=payload.model_dump()
+            input_payload=payload.model_dump(),
         )
         orch_id = orchestrator.run()
+        with SessionLocal() as persist_db:
+            persist_run_bundle(persist_db, orch_id)
 
-        orchestrator_record = db.query(AgentRunModel).get(orch_id)
+        orchestrator_record = store.agent_runs.get(orch_id)
         if not orchestrator_record:
             raise HTTPException(status_code=500, detail="Orchestrator run record not found")
-
         if orchestrator_record.status != "completed":
             raise HTTPException(
                 status_code=422,
-                detail=orchestrator_record.error_message or "Routing failed"
+                detail=orchestrator_record.error_message or "Routing failed",
             )
 
         route = orchestrator_record.input_payload.get("route_decision", {})
@@ -61,48 +124,57 @@ async def dispatch_agent(
         target_task = route.get("target_task")
 
         if target_agent == "modeling" and target_task == "dcf_model":
+            _ensure_documents_ready_for_run(db, deal_id)
             specialized_payload = payload.model_dump()
             specialized_payload["agent_type"] = target_agent
             specialized_payload["task_name"] = target_task
             specialized_agent = FinancialModelingAgent(deal_id, specialized_payload)
-            run_id = specialized_agent.run()
-        else:
-            run_id = orch_id
-            
-        # Fetch the resulting run log from the db
-        run_record = db.query(AgentRunModel).get(run_id)
-        
+            with SessionLocal() as persist_db:
+                persist_run_bundle(persist_db, specialized_agent.run_id)
+            _agent_pool.submit(_execute_modeling_run, specialized_agent)
+
+            run_record = store.agent_runs.get(specialized_agent.run_id)
+            return APIResponse(
+                success=True,
+                data={
+                    **_serialize_run(run_record),
+                    "route": route,
+                },
+                meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
+            )
+
+        run_record = store.agent_runs.get(orch_id)
         return APIResponse(
             success=True,
             data={
-                "run_id": run_id,
-                "status": run_record.status if run_record else "unknown",
-                "steps": run_record.reasoning_steps if run_record else [],
+                **_serialize_run(run_record),
                 "route": route,
-                "valuation_result": run_record.input_payload.get("valuation_result") if run_record else None
             },
-            meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")
+            meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
         )
-        
-    except Exception as e:
+    except HTTPException:
+        raise
+    except Exception:
         logger.exception("Agent dispatch failed for deal %s", deal_id)
         raise HTTPException(status_code=500, detail="Agent execution failed. Check server logs for details.")
+
 
 @router.get("/{deal_id}/agents/runs", response_model=APIResponse)
 async def list_agent_runs(
     deal_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    deal = db.query(DealModel).filter(
-        DealModel.id == deal_id,
-        DealModel.tenant_id == user["tenant_id"]
-    ).first()
+    deal = get_deal_for_user(db, deal_id, current_user["tenant_id"])
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
-        
-    runs = db.query(AgentRunModel).filter(AgentRunModel.deal_id == deal_id).all()
-    
+
+    runs = (
+        db.query(AgentRunModel)
+        .filter(AgentRunModel.deal_id == deal_id)
+        .order_by(AgentRunModel.created_at.desc())
+        .all()
+    )
     return APIResponse(
         success=True,
         data={
@@ -112,9 +184,54 @@ async def list_agent_runs(
                     "agent_type": run.agent_type,
                     "task_name": run.task_name,
                     "status": run.status,
-                    "created_at": run.created_at.isoformat()
-                } for run in runs
+                    "created_at": run.created_at.isoformat(),
+                }
+                for run in runs
             ]
         },
-        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}")
+        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
+    )
+
+
+@router.get("/{deal_id}/agents/runs/{run_id}", response_model=APIResponse)
+async def get_agent_run(
+    deal_id: str,
+    run_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    deal = get_deal_for_user(db, deal_id, current_user["tenant_id"])
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    run_record = store.agent_runs.get(run_id)
+    if run_record and run_record.deal_id == deal_id:
+        payload = _serialize_run(run_record)
+        payload["route"] = run_record.input_payload.get("route_decision", {})
+        return APIResponse(
+            success=True,
+            data=payload,
+            meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
+        )
+
+    db_run = (
+        db.query(AgentRunModel)
+        .filter(AgentRunModel.id == run_id, AgentRunModel.deal_id == deal_id)
+        .first()
+    )
+    if not db_run:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    return APIResponse(
+        success=True,
+        data={
+            "run_id": db_run.id,
+            "status": db_run.status,
+            "steps": [],
+            "valuation_result": (db_run.input_payload or {}).get("valuation_result"),
+            "error_message": db_run.error_message,
+            "confidence_score": db_run.confidence_score,
+            "route": (db_run.input_payload or {}).get("route_decision", {}),
+        },
+        meta=Meta(request_id=f"req_{uuid.uuid4().hex[:8]}"),
     )

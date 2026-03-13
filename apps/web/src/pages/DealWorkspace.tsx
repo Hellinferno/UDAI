@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
-import { fetchDeal, type Deal } from '../lib/api'
+import { fetchCurrentUser, fetchDeal, type CurrentUserInfo, type Deal } from '../lib/api'
 import { ArrowLeft, FileText, Bot, Download, LayoutDashboard } from 'lucide-react'
 import DocumentsTab from '../components/workspace/DocumentsTab'
 import AgentsTab from '../components/workspace/AgentsTab'
@@ -19,14 +19,19 @@ export default function DealWorkspace() {
     const { dealId } = useParams<{ dealId: string }>()
     const navigate = useNavigate()
     const [deal, setDeal] = useState<Deal | null>(null)
+    const [currentUser, setCurrentUser] = useState<CurrentUserInfo | null>(null)
     const [loading, setLoading] = useState(true)
     const [activeTab, setActiveTab] = useState<TabKey>('overview')
 
     const loadDeal = useCallback(async () => {
         if (!dealId) return
         try {
-            const d = await fetchDeal(dealId)
+            const [d, user] = await Promise.all([
+                fetchDeal(dealId),
+                fetchCurrentUser(),
+            ])
             setDeal(d)
+            setCurrentUser(user)
         } catch {
             console.error('Failed to load deal')
         } finally {
@@ -70,6 +75,7 @@ export default function DealWorkspace() {
                     <p style={{ color: '#555', fontSize: 11, margin: 0 }}>{deal.company_name} · {deal.deal_type}</p>
                 </div>
                 <div style={{ display: 'flex', gap: 6 }}>
+                    {currentUser && <span className="badge badge-amber">{currentUser.role}</span>}
                     <span className="badge badge-indigo">{deal.deal_type}</span>
                     <span className="badge badge-emerald">{deal.deal_stage}</span>
                 </div>

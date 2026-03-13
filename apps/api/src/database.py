@@ -1,8 +1,10 @@
+import os
+from threading import Lock
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-import os
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -16,11 +18,34 @@ connect_args = {"check_same_thread": False} if SQLALCHEMY_DATABASE_URL.startswit
 engine = create_engine(
     SQLALCHEMY_DATABASE_URL, connect_args=connect_args
 )
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+SessionLocal = sessionmaker(
+    autocommit=False,
+    autoflush=False,
+    expire_on_commit=False,
+    bind=engine,
+)
 
 Base = declarative_base()
+_schema_ready = False
+_schema_lock = Lock()
+
+
+def ensure_database_ready() -> None:
+    """Create tables lazily for direct module/test usage outside FastAPI startup."""
+    global _schema_ready
+    if _schema_ready:
+        return
+
+    with _schema_lock:
+        if _schema_ready:
+            return
+        import db_models  # noqa: F401 - ensure metadata is registered before create_all
+
+        Base.metadata.create_all(bind=engine)
+        _schema_ready = True
 
 def get_db():
+    ensure_database_ready()
     db = SessionLocal()
     try:
         yield db

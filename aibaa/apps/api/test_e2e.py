@@ -10,7 +10,7 @@ with open("C:/tmp/e2e_output.txt", "w", encoding="utf-8") as f:
     deal_data = {
         "name": "Relaxo Footwears DCF",
         "company_name": "Relaxo Footwears Limited",
-        "deal_type": "Valuation",
+        "deal_type": "other",
         "industry": "Consumer Staples / Footwear"
     }
     r = requests.post(f"{BASE_URL}/deals", json=deal_data)

@@ -1,13 +1,26 @@
 import json
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from openai import OpenAI
 
-# Load environment variables
-load_dotenv()
+
+def _load_env_files() -> None:
+    """Load env files from stable project locations instead of relying on CWD."""
+    env_candidates = [
+        Path(__file__).resolve().parents[2] / ".env",
+        Path.cwd() / ".env",
+    ]
+
+    for env_path in env_candidates:
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+_load_env_files()
 
 # Check if API keys are available
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")

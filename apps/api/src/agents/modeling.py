@@ -451,6 +451,65 @@ class FinancialModelingAgent(BaseAgent):
 
         return estimated_nol
 
+    @classmethod
+    def _build_market_sanity_snapshot(
+        cls,
+        valuation_data: dict,
+        shares_outstanding: Optional[float],
+        params: dict,
+    ) -> dict:
+        market_cap = cls._to_number(params.get("current_market_cap"))
+        current_share_price = cls._to_number(params.get("current_share_price"))
+
+        if market_cap is None and current_share_price is not None and shares_outstanding:
+            market_cap = current_share_price * shares_outstanding
+        if current_share_price is None and market_cap is not None and shares_outstanding:
+            current_share_price = market_cap / shares_outstanding
+
+        if market_cap is None and current_share_price is None:
+            return {}
+
+        implied_equity_value = cls._to_number(valuation_data.get("implied_equity_value"))
+        implied_share_price = cls._to_number(valuation_data.get("implied_share_price"))
+
+        equity_gap_pct = None
+        share_price_gap_pct = None
+        gap_candidates = []
+        reasons = []
+
+        if market_cap is not None and implied_equity_value is not None and market_cap > 0:
+            equity_gap_pct = (implied_equity_value - market_cap) / market_cap
+            gap_candidates.append(abs(equity_gap_pct))
+            reasons.append(
+                f"implied equity value vs market cap gap = {equity_gap_pct * 100:.1f}%"
+            )
+
+        if current_share_price is not None and implied_share_price is not None and current_share_price > 0:
+            share_price_gap_pct = (implied_share_price - current_share_price) / current_share_price
+            gap_candidates.append(abs(share_price_gap_pct))
+            reasons.append(
+                f"implied share price vs market price gap = {share_price_gap_pct * 100:.1f}%"
+            )
+
+        max_gap = max(gap_candidates) if gap_candidates else 0.0
+        if max_gap >= 0.75:
+            status = "flagged"
+        elif max_gap >= 0.35:
+            status = "warning"
+        else:
+            status = "ok"
+
+        return {
+            "status": status,
+            "market_cap": round(market_cap, 2) if market_cap is not None else None,
+            "current_share_price": round(current_share_price, 2) if current_share_price is not None else None,
+            "implied_equity_value": round(implied_equity_value, 2) if implied_equity_value is not None else None,
+            "implied_share_price": round(implied_share_price, 2) if implied_share_price is not None else None,
+            "equity_value_gap_pct": round(equity_gap_pct, 4) if equity_gap_pct is not None else None,
+            "share_price_gap_pct": round(share_price_gap_pct, 4) if share_price_gap_pct is not None else None,
+            "reasons": reasons,
+        }
+
     @staticmethod
     def _infer_public_company_risk_overlay(industry: str, margins: list) -> dict:
         industry_blob = (industry or "").lower()
@@ -1213,7 +1272,10 @@ class FinancialModelingAgent(BaseAgent):
             llm_data = self._enforce_capital_structure_consistency(llm_data)
             if fallback_mode:
                 self.observe(f"Using deterministic fallback profile: {fallback_profile or 'default'}")
-            self.observe(f"Normalized extraction payload: {json.dumps(llm_data)}")
+            self.observe(
+                "Normalized extraction payload keys: "
+                + ", ".join(sorted(llm_data.keys()))
+            )
 
         if has_uploaded_documents and fallback_mode:
             self.observe(
@@ -1907,6 +1969,12 @@ class FinancialModelingAgent(BaseAgent):
                 valuation_data["implied_share_price"] = None
                 valuation_basis = "equity_value"
 
+            market_sanity = self._build_market_sanity_snapshot(
+                valuation_data=valuation_data,
+                shares_outstanding=shares_for_valuation,
+                params=params,
+            )
+
             ufcf = projections_data["projections"]["ufcf"]
             comps_engine = ComparableAnalysisEngine()
             latest_revenue_for_comps = historical_revenues[-1] if historical_revenues else 0.0
@@ -2200,6 +2268,18 @@ class FinancialModelingAgent(BaseAgent):
                     + "; ".join(sector_routing["reasons"])
                     + "."
                 )
+            if market_sanity.get("status") == "flagged":
+                warnings.append(
+                    "MARKET SANITY CHECK FLAGGED: "
+                    + "; ".join(market_sanity.get("reasons", []))
+                    + "."
+                )
+            elif market_sanity.get("status") == "warning":
+                warnings.append(
+                    "MARKET SANITY CHECK WARNING: "
+                    + "; ".join(market_sanity.get("reasons", []))
+                    + "."
+                )
             if tax_loss_carryforward > 0:
                 warnings.append(
                     f"TAX LOSS CARRYFORWARD MODELED: opening NOL estimated at {tax_loss_carryforward:,.0f}."
@@ -2267,6 +2347,7 @@ class FinancialModelingAgent(BaseAgent):
                     "tgr": sensitivity.get("tgr_headers", []),
                     "metric": sensitivity.get("metric", valuation_basis),
                 },
+                "market_sanity": market_sanity,
                 "extraction_quality": extraction_quality,
                 "company_classification": company_context,
                 "assumptions": projections_data["assumptions"],

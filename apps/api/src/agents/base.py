@@ -1,9 +1,8 @@
 import logging
 import uuid
-import time
-from typing import Dict, Any, List
+from typing import Any, Dict
 
-from database import SessionLocal
+from database import SessionLocal, ensure_database_ready
 from db_models import AgentRunModel
 
 logger = logging.getLogger(__name__)
@@ -18,7 +17,8 @@ class BaseAgent:
         
         # Initialize run tracking
         self.run_id = str(uuid.uuid4())
-        
+
+        ensure_database_ready()
         with SessionLocal() as db:
             self.run_record = AgentRunModel(
                 id=self.run_id,
@@ -34,8 +34,9 @@ class BaseAgent:
 
     def _sync_to_db(self):
         """Helper to sync current state to database."""
+        ensure_database_ready()
         with SessionLocal() as db:
-            db_record = db.query(AgentRunModel).get(self.run_id)
+            db_record = db.get(AgentRunModel, self.run_id)
             if db_record:
                 # Using SQLAlchemy JSON columns requires reassignment for modification tracking sometimes
                 db_record.reasoning_steps = list(self.run_record.reasoning_steps)

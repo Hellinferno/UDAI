@@ -1,7 +1,24 @@
 import requests
 import json
+import os
 
 BASE_URL = "http://127.0.0.1:8000/api/v1"
+DEV_BOOTSTRAP_TOKEN = os.getenv("AIBAA_API_TOKEN", "dev-local-token")
+
+
+def get_auth_headers(role: str = "reviewer") -> dict[str, str]:
+    response = requests.post(
+        f"{BASE_URL}/auth/dev-token",
+        json={"requested_role": role},
+        headers={"X-Dev-API-Token": DEV_BOOTSTRAP_TOKEN},
+        timeout=30,
+    )
+    response.raise_for_status()
+    token = response.json()["data"]["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+AUTH_HEADERS = get_auth_headers()
 
 with open("C:/tmp/e2e_output.txt", "w", encoding="utf-8") as f:
     r = requests.get(f"{BASE_URL}/health")
@@ -10,10 +27,10 @@ with open("C:/tmp/e2e_output.txt", "w", encoding="utf-8") as f:
     deal_data = {
         "name": "Relaxo Footwears DCF",
         "company_name": "Relaxo Footwears Limited",
-        "deal_type": "Valuation",
+        "deal_type": "other",
         "industry": "Consumer Staples / Footwear"
     }
-    r = requests.post(f"{BASE_URL}/deals", json=deal_data)
+    r = requests.post(f"{BASE_URL}/deals", json=deal_data, headers=AUTH_HEADERS)
     deal = r.json().get("data", {})
     deal_id = deal.get("id")
     f.write(f"[Deal] Created: {deal_id}\n")
@@ -28,7 +45,12 @@ with open("C:/tmp/e2e_output.txt", "w", encoding="utf-8") as f:
     }
 
     f.write(f"\n[Agent] Running DCF model...\n")
-    r = requests.post(f"{BASE_URL}/deals/{deal_id}/agents/run", json=agent_payload, timeout=120)
+    r = requests.post(
+        f"{BASE_URL}/deals/{deal_id}/agents/run",
+        json=agent_payload,
+        headers=AUTH_HEADERS,
+        timeout=120,
+    )
     agent_resp = r.json().get("data", {})
 
     f.write(f"[Agent] Status: {agent_resp.get('status')}\n")

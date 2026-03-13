@@ -14,7 +14,7 @@ print("\n=== Test 2: Create Deal ===")
 deal_data = {
     "name": "Test Deal",
     "company_name": "Test Co",
-    "deal_type": "M&A",
+    "deal_type": "ma",
     "industry": "Tech"
 }
 r = requests.post(f"{BASE_URL}/deals", json=deal_data)

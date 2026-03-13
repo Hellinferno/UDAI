@@ -1,6 +1,7 @@
 import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
@@ -20,6 +21,7 @@ DealStageStr = Literal[
 PriorityStr = Literal["low", "medium", "high"]
 
 ReviewStatusStr = Literal["draft", "in_review", "approved", "rejected"]
+UserRoleStr = Literal["analyst", "reviewer", "admin"]
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 
@@ -95,6 +97,33 @@ class OutputReviewUpdate(BaseModel):
     @classmethod
     def sanitize_reviewer_notes(cls, v):
         return _strip_html(v)
+
+
+class DevAuthTokenRequest(BaseModel):
+    requested_role: UserRoleStr = "analyst"
+    tenant_id: Optional[str] = Field(None, min_length=1, max_length=80)
+    user_id: Optional[str] = Field(None, min_length=1, max_length=80)
+    email: Optional[str] = Field(None, max_length=120)
+
+    @field_validator("tenant_id", "user_id", "email", mode="before")
+    @classmethod
+    def strip_optional_whitespace(cls, v):
+        return v.strip() if isinstance(v, str) else v
+
+
+class CurrentUserResponse(BaseModel):
+    user_id: str
+    tenant_id: str
+    role: UserRoleStr | str
+    email: Optional[str] = None
+    token_id: Optional[str] = None
+
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: str
+    user: CurrentUserResponse
 
 
 # ---------------------------------------------------------------------------

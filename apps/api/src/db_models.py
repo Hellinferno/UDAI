@@ -122,3 +122,14 @@ class TaskModel(Base):
     owner = Column(String, default="AI Agent")
     is_ai_generated = Column(Boolean, default=True)
     created_at = Column(DateTime, default=_utcnow)
+
+
+class OutputReviewEventModel(Base):
+    __tablename__ = "output_review_events"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    output_id = Column(String, ForeignKey("outputs.id"), index=True)
+    reviewer_id = Column(String, index=True)
+    review_status = Column(String, default="draft")
+    reviewer_notes = Column(String, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)

@@ -2,11 +2,73 @@ import axios from 'axios';
 
 const rawApiBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.trim();
 const API_BASE_URL = rawApiBase && rawApiBase.length > 0 ? rawApiBase.replace(/\/$/, '') : '/api/v1';
+const BOOTSTRAP_TOKEN = (import.meta.env.VITE_API_TOKEN as string | undefined)?.trim() || 'dev-local-token';
+const DEV_AUTH_ROLE = (import.meta.env.VITE_DEV_AUTH_ROLE as string | undefined)?.trim() || 'reviewer';
+const DEFAULT_API_TIMEOUT_MS = 30_000;
+const AGENT_RUN_TIMEOUT_MS = 5 * 60_000;
 
 const api = axios.create({
     baseURL: API_BASE_URL,
-    headers: { 'Content-Type': 'application/json' },
-    timeout: 30000,
+    headers: {
+        'Content-Type': 'application/json',
+    },
+    timeout: DEFAULT_API_TIMEOUT_MS,
+});
+
+const authApi = axios.create({
+    baseURL: API_BASE_URL,
+    headers: {
+        'Content-Type': 'application/json',
+    },
+    timeout: DEFAULT_API_TIMEOUT_MS,
+});
+
+function looksLikeJwt(token: string | null | undefined): boolean {
+    return Boolean(token && token.split('.').length === 3);
+}
+
+let accessToken: string | null = looksLikeJwt(BOOTSTRAP_TOKEN) ? BOOTSTRAP_TOKEN : null;
+let authBootstrapPromise: Promise<string | null> | null = null;
+let currentUserCache: CurrentUserInfo | null = null;
+
+async function bootstrapDevToken(): Promise<string | null> {
+    if (!BOOTSTRAP_TOKEN || looksLikeJwt(BOOTSTRAP_TOKEN)) {
+        return accessToken;
+    }
+
+    const res = await authApi.post<APIResponse<AuthTokenSession>>(
+        '/auth/dev-token',
+        { requested_role: DEV_AUTH_ROLE },
+        {
+            headers: {
+                'X-Dev-API-Token': BOOTSTRAP_TOKEN,
+            },
+        }
+    );
+    accessToken = res.data.data.access_token;
+    currentUserCache = res.data.data.user;
+    return accessToken;
+}
+
+async function ensureAuthToken(): Promise<string | null> {
+    if (accessToken) {
+        return accessToken;
+    }
+    if (!authBootstrapPromise) {
+        authBootstrapPromise = bootstrapDevToken().finally(() => {
+            authBootstrapPromise = null;
+        });
+    }
+    return authBootstrapPromise;
+}
+
+api.interceptors.request.use(async (config) => {
+    const token = await ensureAuthToken();
+    if (token) {
+        config.headers = config.headers ?? {};
+        config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
 });
 
 // ─── Types ───
@@ -59,6 +121,9 @@ export interface AgentRunResult {
     status: string;
     steps: Array<Record<string, unknown>>;
     valuation_result?: ValuationResult;
+    error_message?: string | null;
+    confidence_score?: number | null;
+    route?: Record<string, unknown>;
 }
 
 export interface ValuationResult {
@@ -174,10 +239,40 @@ export interface OutputInfo {
     created_at: string;
 }
 
+export interface OutputReviewPayload {
+    review_status: 'draft' | 'in_review' | 'approved' | 'rejected';
+    reviewer_notes?: string;
+}
+
+export interface CurrentUserInfo {
+    user_id: string;
+    tenant_id: string;
+    role: string;
+    email?: string | null;
+    token_id?: string | null;
+}
+
+interface AuthTokenSession {
+    access_token: string;
+    token_type: string;
+    expires_at: string;
+    user: CurrentUserInfo;
+}
+
 interface APIResponse<T> {
     success: boolean;
     data: T;
     meta: { timestamp: string; request_id: string };
+}
+
+export async function fetchCurrentUser(forceRefresh = false): Promise<CurrentUserInfo> {
+    if (currentUserCache && !forceRefresh) {
+        return currentUserCache;
+    }
+    await ensureAuthToken();
+    const res = await api.get<APIResponse<CurrentUserInfo>>('/auth/me');
+    currentUserCache = res.data.data;
+    return currentUserCache;
 }
 
 // ─── Deals ───
@@ -240,7 +335,16 @@ export async function deleteDocument(dealId: string, docId: string): Promise<voi
 // ─── Agents ───
 
 export async function deployAgent(dealId: string, payload: AgentRunPayload): Promise<AgentRunResult> {
-    const res = await api.post<APIResponse<AgentRunResult>>(`/deals/${dealId}/agents/run`, payload);
+    const res = await api.post<APIResponse<AgentRunResult>>(
+        `/deals/${dealId}/agents/run`,
+        payload,
+        { timeout: AGENT_RUN_TIMEOUT_MS }
+    );
+    return res.data.data;
+}
+
+export async function fetchAgentRun(dealId: string, runId: string): Promise<AgentRunResult> {
+    const res = await api.get<APIResponse<AgentRunResult>>(`/deals/${dealId}/agents/runs/${runId}`);
     return res.data.data;
 }
 
@@ -253,4 +357,22 @@ export async function fetchOutputs(dealId: string): Promise<OutputInfo[]> {
 
 export function getDownloadUrl(outputId: string): string {
     return `${API_BASE_URL}/outputs/${outputId}/download`;
+}
+
+export async function reviewOutput(outputId: string, payload: OutputReviewPayload): Promise<void> {
+    await api.patch(`/outputs/${outputId}/review`, payload);
+}
+
+export async function downloadOutput(outputId: string, filename: string): Promise<void> {
+    const res = await api.get<Blob>(`/outputs/${outputId}/download`, {
+        responseType: 'blob',
+    });
+    const blobUrl = window.URL.createObjectURL(res.data);
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(blobUrl);
 }

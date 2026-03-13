@@ -1,7 +1,24 @@
 import requests
 import json
+import os
 
 BASE_URL = "http://127.0.0.1:8000/api/v1"
+DEV_BOOTSTRAP_TOKEN = os.getenv("AIBAA_API_TOKEN", "dev-local-token")
+
+
+def get_auth_headers(role: str = "reviewer") -> dict[str, str]:
+    response = requests.post(
+        f"{BASE_URL}/auth/dev-token",
+        json={"requested_role": role},
+        headers={"X-Dev-API-Token": DEV_BOOTSTRAP_TOKEN},
+        timeout=30,
+    )
+    response.raise_for_status()
+    token = response.json()["data"]["access_token"]
+    return {"Authorization": f"Bearer {token}"}
+
+
+AUTH_HEADERS = get_auth_headers()
 
 # Test 1: Health check
 print("=== Test 1: Health Check ===")
@@ -14,10 +31,10 @@ print("\n=== Test 2: Create Deal ===")
 deal_data = {
     "name": "Test Deal",
     "company_name": "Test Co",
-    "deal_type": "M&A",
+    "deal_type": "ma",
     "industry": "Tech"
 }
-r = requests.post(f"{BASE_URL}/deals", json=deal_data)
+r = requests.post(f"{BASE_URL}/deals", json=deal_data, headers=AUTH_HEADERS)
 print(f"Status: {r.status_code}")
 response = r.json()
 print(f"Response: {json.dumps(response, indent=2)}")
@@ -36,7 +53,7 @@ if deal_id:
             "terminal_growth_rate": 0.025
         }
     }
-    r = requests.post(f"{BASE_URL}/deals/{deal_id}/agents/run", json=agent_payload)
+    r = requests.post(f"{BASE_URL}/deals/{deal_id}/agents/run", json=agent_payload, headers=AUTH_HEADERS)
     print(f"Status: {r.status_code}")
     agent_response = r.json()
     print(f"Response status: {agent_response.get('data', {}).get('status')}")

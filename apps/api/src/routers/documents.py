@@ -1,17 +1,23 @@
+import logging
 import os
 import re
 import uuid
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, status, Depends
-from sqlalchemy.orm import Session
+from pathlib import Path
 from typing import List, Optional
 
-from models import APIResponse, Meta
-from db_models import DealModel, DocumentModel
-from dependencies import get_db, get_current_user
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from sqlalchemy.orm import Session
+
 from database import SessionLocal
+from db_models import DocumentModel
+from dependencies import get_current_user, get_db
+from models import APIResponse, Meta
+from persistence import get_deal_for_user, sync_document_to_store
+from store import store
 from tools.document_parser import parse_document
+
+logger = logging.getLogger(__name__)
 
 # Background parser pool: same as startup recovery
 _parser_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="doc_parse")
@@ -27,42 +33,53 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 # Allowlisted extensions and their expected magic-byte prefixes.
 # None means magic-bytes check is skipped (text-based formats).
 _ALLOWED_TYPES: dict[str, Optional[bytes]] = {
-    "pdf":  b"%PDF",
-    "docx": b"PK\x03\x04",   # Office Open XML (ZIP)
+    "pdf": b"%PDF",
+    "docx": b"PK\x03\x04",
     "xlsx": b"PK\x03\x04",
-    "xls":  b"\xd0\xcf\x11\xe0",  # Compound Document (old Office)
-    "csv":  None,
-    "txt":  None,
+    "xls": b"\xd0\xcf\x11\xe0",
+    "csv": None,
+    "txt": None,
     "json": None,
 }
 
 _SAFE_NAME_RE = re.compile(r"[^a-z0-9_.\-]")
 
 
-def _parse_document_async(file_id: str, file_path: str, file_type: str):
-    """Parse document in background and update database status."""
+def _parse_document_async(file_id: str, file_path: str, file_type: str) -> None:
+    """Parse document in background and update DB + store status."""
+    db = SessionLocal()
     try:
         parsed_text = parse_document(file_path, file_type)
-        with SessionLocal() as db:
-            doc = db.query(DocumentModel).get(file_id)
-            if doc:
-                doc.parsed_text = parsed_text
-                doc.parse_status = "parsed" if parsed_text else "parse_failed"
-                db.commit()
+        doc = store.documents.get(file_id)
+        if doc:
+            doc.parsed_text = parsed_text
+            doc.parse_status = "parsed" if parsed_text else "parse_failed"
+
+        db_doc = db.query(DocumentModel).filter(DocumentModel.id == file_id).first()
+        if db_doc:
+            db_doc.parsed_text = parsed_text
+            db_doc.parse_status = "parsed" if parsed_text else "parse_failed"
+            db.commit()
+            sync_document_to_store(db_doc)
     except Exception as exc:
-        with SessionLocal() as db:
-            doc = db.query(DocumentModel).get(file_id)
-            if doc:
-                doc.parse_status = "parse_failed"
-                db.commit()
-        print(f"[PARSE_ERROR] {file_id}: {exc}")
+        doc = store.documents.get(file_id)
+        if doc:
+            doc.parse_status = "parse_failed"
+
+        db_doc = db.query(DocumentModel).filter(DocumentModel.id == file_id).first()
+        if db_doc:
+            db_doc.parse_status = "parse_failed"
+            db.commit()
+            sync_document_to_store(db_doc)
+        logger.exception("Document parsing failed for %s", file_id, exc_info=exc)
+    finally:
+        db.close()
 
 
 def _sanitize_filename(raw: str) -> str:
     """Return a safe filename: lowercase, only alphanumeric/dot/hyphen/underscore."""
     name = os.path.basename(raw or "upload").lower().replace(" ", "_")
     name = _SAFE_NAME_RE.sub("_", name)
-    # Strip leading dots (hidden files) and limit length
     name = name.lstrip(".") or "upload"
     return name[:120]
 
@@ -71,7 +88,7 @@ def _magic_ok(content: bytes, ext: str) -> bool:
     """Verify first bytes match the expected signature for the declared extension."""
     expected = _ALLOWED_TYPES.get(ext)
     if expected is None:
-        return True  # text-based; no magic bytes to check
+        return True
     return content[: len(expected)] == expected
 
 
@@ -81,16 +98,12 @@ async def upload_documents(
     files: List[UploadFile] = File(...),
     category: Optional[str] = Form(None),
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    deal = db.query(DealModel).filter(
-        DealModel.id == deal_id,
-        DealModel.tenant_id == user["tenant_id"]
-    ).first()
+    deal = get_deal_for_user(db, deal_id, current_user["tenant_id"])
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    # Validate category to prevent storing arbitrary strings
     if category and len(category) > 60:
         raise HTTPException(status_code=400, detail="Category too long")
 
@@ -108,10 +121,7 @@ async def upload_documents(
             failed_docs.append({"filename": safe_filename, "reason": f"Unsupported file type: .{ext}"})
             continue
 
-        # Read up to limit + 1 byte in memory BEFORE touching disk.
-        # This prevents disk-filling attacks and avoids write-then-delete.
         content = await file.read(MAX_UPLOAD_BYTES + 1)
-
         if len(content) > MAX_UPLOAD_BYTES:
             failed_docs.append({
                 "filename": safe_filename,
@@ -128,20 +138,18 @@ async def upload_documents(
 
         file_id = str(uuid.uuid4())
         dest_path = deal_upload_dir / f"{file_id}_{safe_filename}"
-
-        # Guard: resolved path must stay inside deal_upload_dir
         if not str(dest_path.resolve()).startswith(str(deal_upload_dir.resolve())):
             failed_docs.append({"filename": safe_filename, "reason": "Invalid filename"})
             continue
 
         try:
             dest_path.write_bytes(content)
-        except OSError as exc:
+        except OSError:
             failed_docs.append({"filename": safe_filename, "reason": "Server error saving file"})
-            print(f"[UPLOAD] OSError saving {safe_filename}: {exc}")
+            logger.exception("Failed saving upload %s", safe_filename)
             continue
 
-        new_doc = DocumentModel(
+        db_doc = DocumentModel(
             id=file_id,
             deal_id=deal_id,
             filename=safe_filename,
@@ -151,21 +159,20 @@ async def upload_documents(
             doc_category=category,
             parse_status="parsing",
         )
-        db.add(new_doc)
+        db.add(db_doc)
         db.commit()
-        db.refresh(new_doc)
+        db.refresh(db_doc)
+        sync_document_to_store(db_doc)
 
-        # Queue parsing to run in background thread pool
-        # This prevents the upload response from being blocked
         _parser_pool.submit(_parse_document_async, file_id, str(dest_path), ext)
 
         uploaded_docs.append({
-            "id": new_doc.id,
-            "filename": new_doc.filename,
-            "file_type": new_doc.file_type,
-            "file_size_bytes": new_doc.file_size_bytes,
-            "parse_status": new_doc.parse_status,
-            "uploaded_at": new_doc.uploaded_at.isoformat(),
+            "id": db_doc.id,
+            "filename": db_doc.filename,
+            "file_type": db_doc.file_type,
+            "file_size_bytes": db_doc.file_size_bytes,
+            "parse_status": db_doc.parse_status,
+            "uploaded_at": db_doc.uploaded_at.isoformat(),
         })
 
     if not uploaded_docs and failed_docs:
@@ -183,16 +190,21 @@ async def upload_documents(
 async def list_documents(
     deal_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    deal = db.query(DealModel).filter(
-        DealModel.id == deal_id,
-        DealModel.tenant_id == user["tenant_id"]
-    ).first()
+    deal = get_deal_for_user(db, deal_id, current_user["tenant_id"])
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    docs = db.query(DocumentModel).filter(DocumentModel.deal_id == deal_id).all()
+    docs = (
+        db.query(DocumentModel)
+        .filter(DocumentModel.deal_id == deal_id)
+        .order_by(DocumentModel.uploaded_at.desc())
+        .all()
+    )
+    for doc in docs:
+        sync_document_to_store(doc)
+
     return APIResponse(
         success=True,
         data=[
@@ -213,37 +225,33 @@ async def list_documents(
 
 @router.delete("/{doc_id}", response_model=APIResponse)
 async def delete_document(
-    deal_id: str, 
+    deal_id: str,
     doc_id: str,
     db: Session = Depends(get_db),
-    user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
 ):
-    deal = db.query(DealModel).filter(
-        DealModel.id == deal_id,
-        DealModel.tenant_id == user["tenant_id"]
-    ).first()
+    deal = get_deal_for_user(db, deal_id, current_user["tenant_id"])
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    doc = db.query(DocumentModel).filter(
-        DocumentModel.id == doc_id,
-        DocumentModel.deal_id == deal_id
-    ).first()
-    
-    if not doc:
+    db_doc = (
+        db.query(DocumentModel)
+        .filter(DocumentModel.id == doc_id, DocumentModel.deal_id == deal_id)
+        .first()
+    )
+    if not db_doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete from filesystem
-    doc_path = Path(doc.storage_path)
-    # Safety: only delete if it's still inside the upload base
+    doc_path = Path(db_doc.storage_path)
     try:
         if doc_path.resolve().is_relative_to(_UPLOAD_BASE.resolve()) and doc_path.exists():
             doc_path.unlink()
     except (ValueError, OSError):
-        pass  # Log but don't expose internals
+        logger.warning("Failed deleting document file for %s", doc_id, exc_info=True)
 
-    db.delete(doc)
+    db.delete(db_doc)
     db.commit()
+    store.documents.pop(doc_id, None)
 
     return APIResponse(
         success=True,

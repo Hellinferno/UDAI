@@ -27,6 +27,15 @@ export default function DocumentsTab({ dealId }: Props) {
 
     useEffect(() => { load() }, [load])
 
+    useEffect(() => {
+        const hasActiveParsing = docs.some(doc => doc.parse_status === 'parsing' || doc.parse_status === 'pending')
+        if (!hasActiveParsing) return
+        const interval = window.setInterval(() => {
+            load()
+        }, 3000)
+        return () => window.clearInterval(interval)
+    }, [docs, load])
+
     const handleUpload = async (files: FileList | null) => {
         if (!files || files.length === 0) return
         setUploading(true)
@@ -140,7 +149,7 @@ export default function DocumentsTab({ dealId }: Props) {
                                     <td>{formatBytes(doc.file_size_bytes)}</td>
                                     <td>
                                         <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                                            <span className={`status-dot ${doc.parse_status === 'ready' ? 'active' : 'pending'}`} />
+                                            <span className={`status-dot ${doc.parse_status === 'parsed' ? 'active' : 'pending'}`} />
                                             {doc.parse_status}
                                         </span>
                                     </td>
