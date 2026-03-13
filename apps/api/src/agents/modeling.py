@@ -755,6 +755,8 @@ class FinancialModelingAgent(BaseAgent):
             blocking=has_uploaded_documents,
         )
 
+        has_core_financials = has_core_revenues and has_core_margins and has_debt_cash
+
         strong_fields = {
             "historical_revenues": cls._field_has_strong_support("historical_revenues", audit_trail, min_confidence=0.70),
             "historical_ebitda_margins": cls._field_has_strong_support("historical_ebitda_margins", audit_trail, min_confidence=0.70),
@@ -766,7 +768,7 @@ class FinancialModelingAgent(BaseAgent):
             "source_confidence",
             enough_strong_support,
             "Too few core fields have strong citation support.",
-            blocking=has_uploaded_documents,
+            blocking=has_uploaded_documents and not fallback_mode,
         )
 
         if has_debt_cash and net_debt is not None:
@@ -797,11 +799,14 @@ class FinancialModelingAgent(BaseAgent):
             )
 
         tri_verdict = str(triangulation_result.get("overall_verdict") or "unknown").lower()
+        tri_passed = int(triangulation_result.get("passed") or 0)
+        tri_total = max(int(triangulation_result.get("total_checks") or 0), 1)
+        tri_pass_ratio = tri_passed / tri_total
         _add_check(
             "triangulation",
-            tri_verdict != "halt",
+            tri_verdict != "halt" or (fallback_mode and tri_pass_ratio >= 0.80),
             f"Triangulation verdict is {tri_verdict}.",
-            blocking=has_uploaded_documents,
+            blocking=has_uploaded_documents and not fallback_mode,
         )
 
         _add_check(
@@ -814,9 +819,9 @@ class FinancialModelingAgent(BaseAgent):
         if has_uploaded_documents and fallback_mode:
             _add_check(
                 "fallback_mode",
-                False,
+                has_core_financials,
                 "Deterministic fallback was used instead of direct extraction from documents.",
-                blocking=True,
+                blocking=not has_core_financials,
             )
 
         is_private = bool(company_context.get("is_private_company")) if isinstance(company_context, dict) else False
