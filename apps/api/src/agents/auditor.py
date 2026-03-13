@@ -25,7 +25,9 @@ class AuditorAgent:
                 "corrections": {},
             }
 
-        if preparer_output.get("extraction_mode") == "deterministic_fallback":
+        extraction_mode = preparer_output.get("extraction_mode")
+
+        if extraction_mode == "deterministic_fallback":
             verdicts = []
             for entry in audit_trail:
                 verdicts.append(
@@ -40,6 +42,24 @@ class AuditorAgent:
                 "overall_status": "approved",
                 "field_verdicts": verdicts,
                 "auditor_notes": "Deterministic fallback used. Auto-approved with reduced confidence.",
+                "corrections": {},
+            }
+
+        if extraction_mode == "structured_spreadsheet":
+            verdicts = []
+            for entry in audit_trail:
+                verdicts.append(
+                    {
+                        "field": entry["field"],
+                        "status": "approved",
+                        "auditor_confidence": 0.85,
+                        "reason": "Structured spreadsheet extraction provided deterministic sheet/row citations.",
+                    }
+                )
+            return {
+                "overall_status": "approved",
+                "field_verdicts": verdicts,
+                "auditor_notes": "Structured spreadsheet extraction used. Auto-approved pending any downstream triangulation failures.",
                 "corrections": {},
             }
 

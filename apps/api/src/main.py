@@ -19,6 +19,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic_settings import BaseSettings
 
 from routers import deals, documents, agents, outputs
+from database import engine, Base
+import db_models
+
+# Ensure database tables are created synchronously on startup
+Base.metadata.create_all(bind=engine)
 
 
 class Settings(BaseSettings):

@@ -20,8 +20,10 @@ class DCFEngine:
                  tax_rate: float = 0.25, cap_ex_percent_rev: float = 0.04,
                  nwc_percent_rev: float = 0.10, da_percent_rev: float = 0.05,
                  revenue_cagr_override: float = None,
+                 margin_baseline_override: Optional[float] = None,
                  base_fy: int = 2025,
                  tax_loss_carryforward: float = 0.0,
+                 nwc_method: str = "days",
                  # Working capital assumptions
                  dso: float = 45.0,  # Days Sales Outstanding
                  dpo: float = 30.0,  # Days Payable Outstanding
@@ -39,8 +41,10 @@ class DCFEngine:
         self.nwc_percent_rev = nwc_percent_rev
         self.da_percent_rev = da_percent_rev
         self.revenue_cagr_override = revenue_cagr_override
+        self.margin_baseline_override = margin_baseline_override
         self.base_fy = base_fy
         self.tax_loss_carryforward = max(0.0, float(tax_loss_carryforward or 0.0))
+        self.nwc_method = (nwc_method or "days").strip().lower()
         
         # Working capital days
         self.dso = dso
@@ -127,7 +131,11 @@ class DCFEngine:
         floored to an arbitrary positive margin in Year 1.
         """
         latest_margin = self.historical_ebitda_margins[-1]
-        avg_margin = sum(self.historical_ebitda_margins) / len(self.historical_ebitda_margins)
+        avg_margin = (
+            float(self.margin_baseline_override)
+            if self.margin_baseline_override is not None
+            else sum(self.historical_ebitda_margins) / len(self.historical_ebitda_margins)
+        )
         positive_history = [margin for margin in self.historical_ebitda_margins if margin > 0]
 
         if latest_margin < 0 or avg_margin < 0:
@@ -151,6 +159,52 @@ class DCFEngine:
 
         return path, latest_margin, target_margin
 
+    def _calculate_nwc_components(
+        self,
+        current_rev: float,
+        previous_rev: float,
+        current_margin: float,
+        last_nwc_balance: float,
+    ) -> Tuple[float, float, float, float, float]:
+        """
+        Return receivables, payables, inventory, current NWC balance, and change in NWC.
+
+        `days` mode uses DSO/DPO/DIO.
+        `percent_revenue_balance` mode derives change in NWC from revenue growth/decline:
+            change_in_nwc = (current_rev - previous_rev) * nwc_percent_rev
+        This lets sector routing model negative/near-zero working-capital drag for asset-light firms.
+        """
+        if self.nwc_method == "percent_revenue_balance":
+            nwc_balance = current_rev * self.nwc_percent_rev
+            change_in_nwc = nwc_balance - last_nwc_balance
+            return 0.0, 0.0, 0.0, nwc_balance, change_in_nwc
+
+        daily_revenue = current_rev / 365
+        receivables = daily_revenue * self.dso
+
+        cogs_percent_rev = max(0.0, 1.0 - current_margin - self.da_percent_rev)
+        daily_cogs = (current_rev * cogs_percent_rev) / 365
+        payables = daily_cogs * self.dpo
+        inventory = daily_cogs * self.dio
+
+        nwc_balance = receivables + inventory - payables
+        change_in_nwc = nwc_balance - last_nwc_balance
+        return receivables, payables, inventory, nwc_balance, change_in_nwc
+
+    def _estimate_opening_nwc_balance(self, revenue: float, margin: float) -> float:
+        """Estimate the opening NWC balance using the active sector routing method."""
+        if self.nwc_method == "percent_revenue_balance":
+            return revenue * self.nwc_percent_rev
+
+        daily_revenue = revenue / 365
+        receivables = daily_revenue * self.dso
+
+        cogs_percent_rev = max(0.0, 1.0 - margin - self.da_percent_rev)
+        daily_cogs = (revenue * cogs_percent_rev) / 365
+        payables = daily_cogs * self.dpo
+        inventory = daily_cogs * self.dio
+        return receivables + inventory - payables
+
     def build_projections(self, projection_years: int = 7, terminal_growth_rate: float = 0.025,
                           scenario: str = 'base') -> Dict[str, Any]:
         """
@@ -166,7 +220,11 @@ class DCFEngine:
             revenue_cagr = max(-0.30, min(0.30, float(self.revenue_cagr_override)))
         else:
             revenue_cagr = self.calculate_cagr(self.historical_revenues)
-        avg_ebitda_margin = sum(self.historical_ebitda_margins) / len(self.historical_ebitda_margins)
+        avg_ebitda_margin = (
+            float(self.margin_baseline_override)
+            if self.margin_baseline_override is not None
+            else sum(self.historical_ebitda_margins) / len(self.historical_ebitda_margins)
+        )
         
         # Scenario adjustments
         scenario_adjustments = {
@@ -205,7 +263,8 @@ class DCFEngine:
         projected_tax_loss_carryforward = []
 
         last_revenue = self.historical_revenues[-1]
-        last_nwc_balance = last_revenue * self.nwc_percent_rev
+        opening_margin = self.historical_ebitda_margins[-1] if self.historical_ebitda_margins else avg_ebitda_margin
+        last_nwc_balance = self._estimate_opening_nwc_balance(last_revenue, opening_margin)
         nol_balance = self.tax_loss_carryforward
 
         for year in range(1, projection_years + 1):
@@ -255,17 +314,12 @@ class DCFEngine:
             capex = current_rev * self.cap_ex_percent_rev
             projected_capex.append(round(capex, 2))
 
-            # Working Capital using days methodology
-            daily_revenue = current_rev / 365
-            receivables = daily_revenue * self.dso
-            
-            cogs_percent_rev = max(0.0, 1.0 - current_margin - self.da_percent_rev)
-            daily_cogs = (current_rev * cogs_percent_rev) / 365
-            payables = daily_cogs * self.dpo
-            inventory = daily_cogs * self.dio
-            
-            nwc_balance = receivables + inventory - payables
-            change_in_nwc = nwc_balance - last_nwc_balance
+            receivables, payables, inventory, nwc_balance, change_in_nwc = self._calculate_nwc_components(
+                current_rev=current_rev,
+                previous_rev=last_revenue,
+                current_margin=current_margin,
+                last_nwc_balance=last_nwc_balance,
+            )
             
             projected_nwc_change.append(round(change_in_nwc, 2))
             projected_receivables.append(round(receivables, 2))
@@ -297,6 +351,8 @@ class DCFEngine:
                 "da_percent_rev": round(self.da_percent_rev, 4),
                 "cap_ex_percent_rev": round(self.cap_ex_percent_rev, 4),
                 "nwc_percent_rev": round(self.nwc_percent_rev, 4),
+                "nwc_method": self.nwc_method,
+                "margin_baseline_override": round(self.margin_baseline_override, 4) if self.margin_baseline_override is not None else None,
                 "base_fy": self.base_fy,
                 "scenario": adj['label'],
                 "working_capital_days": {
@@ -345,12 +401,15 @@ class DCFEngine:
         # Terminal Value (Gordon Growth Method)
         tv = (final_year_ufcf * (1 + terminal_growth_rate)) / (wacc - terminal_growth_rate)
 
-        # Discount Free Cash Flows
+        # Discount Free Cash Flows using the mid-year convention.
         pv_of_fcf = 0
+        discount_periods = []
         discount_factors = []
         pv_fcf_array = []
         for i, cash_flow in enumerate(ufcf_projections):
-            discount_factor = 1 / ((1 + wacc) ** (i + 1))
+            discount_period = (i + 1) - 0.5
+            discount_factor = 1 / ((1 + wacc) ** discount_period)
+            discount_periods.append(round(discount_period, 2))
             discount_factors.append(round(discount_factor, 4))
 
             pv = cash_flow * discount_factor
@@ -382,6 +441,8 @@ class DCFEngine:
             "wacc": wacc,
             "terminal_growth_rate": terminal_growth_rate,
             "terminal_value": round(tv, 2),
+            "discount_convention": "mid_year",
+            "discount_periods": discount_periods,
             "discount_factors": discount_factors,
             "pv_of_fcf_array": pv_fcf_array,
             "pv_of_fcf_sum": round(pv_of_fcf, 2),
@@ -485,7 +546,8 @@ class DCFEngine:
 
         for margin_rate, label in margin_scenarios:
             new_ufcf = []
-            last_nwc = revs[0] * self.nwc_percent_rev
+            opening_margin = self.historical_ebitda_margins[-1] if self.historical_ebitda_margins else base_margin
+            last_nwc = self._estimate_opening_nwc_balance(revs[0], opening_margin)
             for i, r in enumerate(revs):
                 ebitda = r * margin_rate
                 da = r * self.da_percent_rev
@@ -493,8 +555,13 @@ class DCFEngine:
                 taxes = max(0, ebit * self.tax_rate)
                 ebiat = ebit - taxes
                 capex = r * self.cap_ex_percent_rev
-                nwc_bal = r * self.nwc_percent_rev
-                change_nwc = nwc_bal - last_nwc
+                previous_revenue = revs[i - 1] if i > 0 else revs[0]
+                _, _, _, nwc_bal, change_nwc = self._calculate_nwc_components(
+                    current_rev=r,
+                    previous_rev=previous_revenue,
+                    current_margin=margin_rate,
+                    last_nwc_balance=last_nwc,
+                )
 
                 ufcf = ebiat + da - capex - change_nwc
                 new_ufcf.append(ufcf)

@@ -1,10 +1,12 @@
 import uuid
 import logging
 from typing import Dict, Any
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 
-from store import store
+from db_models import DealModel, DocumentModel, AgentRunModel
+from dependencies import get_db, get_current_user
 from models import APIResponse, Meta
 from agents.orchestrator import OrchestratorAgent
 from agents.modeling import FinancialModelingAgent
@@ -19,11 +21,23 @@ class AgentRunPayload(BaseModel):
     parameters: Dict[str, Any] = Field(default_factory=dict)
 
 @router.post("/{deal_id}/agents/run", response_model=APIResponse)
-async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
-    deal = store.get_deal(deal_id)
+async def dispatch_agent(
+    deal_id: str, 
+    payload: AgentRunPayload,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"]
+    ).first()
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
         
+    docs = db.query(DocumentModel).filter(DocumentModel.deal_id == deal_id).all()
+    if any(d.parse_status in ("pending", "parsing") for d in docs):
+        raise HTTPException(status_code=422, detail="Cannot run agent while documents are still processing.")
+
     try:
         # Initialize the Orchestrator which acts as the main routing brain
         orchestrator = OrchestratorAgent(
@@ -32,7 +46,7 @@ async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
         )
         orch_id = orchestrator.run()
 
-        orchestrator_record = store.agent_runs.get(orch_id)
+        orchestrator_record = db.query(AgentRunModel).get(orch_id)
         if not orchestrator_record:
             raise HTTPException(status_code=500, detail="Orchestrator run record not found")
 
@@ -55,8 +69,8 @@ async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
         else:
             run_id = orch_id
             
-        # Fetch the resulting run log from the store
-        run_record = store.agent_runs.get(run_id)
+        # Fetch the resulting run log from the db
+        run_record = db.query(AgentRunModel).get(run_id)
         
         return APIResponse(
             success=True,
@@ -75,12 +89,19 @@ async def dispatch_agent(deal_id: str, payload: AgentRunPayload):
         raise HTTPException(status_code=500, detail="Agent execution failed. Check server logs for details.")
 
 @router.get("/{deal_id}/agents/runs", response_model=APIResponse)
-async def list_agent_runs(deal_id: str):
-    deal = store.get_deal(deal_id)
+async def list_agent_runs(
+    deal_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"]
+    ).first()
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
         
-    runs = [run for run in store.agent_runs.values() if run.deal_id == deal_id]
+    runs = db.query(AgentRunModel).filter(AgentRunModel.deal_id == deal_id).all()
     
     return APIResponse(
         success=True,

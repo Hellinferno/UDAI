@@ -4,6 +4,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+from agents.auditor import AuditorAgent
 from tools import document_parser as dp
 
 
@@ -97,3 +98,74 @@ def test_parse_excel_emits_sheet_text_and_financial_signals(tmp_path: Path):
     assert "#### EBITDA" in out
     assert "#### Debt" in out
     assert "#### Cash" in out
+
+
+def test_extract_structured_financials_from_ifrs_inr_workbook(tmp_path: Path):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "IFRS-PnL,BS-INR"
+    ws.append(
+        [
+            "Synthetic IFRS financials - INR Mn",
+            "FY21",
+            "FY22",
+            "FY23",
+            "FY24",
+            "FY25",
+        ]
+    )
+    ws.append(["Total Revenue", 1000, 1100, 1210, 1331, 1464.1])
+    ws.append(["Depreciation", 12, 13, 14, 15, 16])
+    ws.append(["Depreciation", 3, 3, 4, 4, 5])
+    ws.append(["Operating Income", 240, 275, 305, 336, 372])
+    ws.append(["Cash and Cash Equivalents", 100, 110, 120, 130, 140])
+    ws.append(["Investments", 200, 210, 220, 230, 240])
+    ws.append(["Bank Deposits", 15, 15, 16, 16, 17])
+    ws.append(["Short-term Borrowings", 10, 9, 8, 7, 6])
+    ws.append(["Net Profit After Taxes", 180, 205, 228, 251, 278])
+    ws.append(["Basic and Diluted EPS", 18, 20.5, 22.8, 25.1, 27.8])
+    ws.append(["Weighted average no of shares used in computing Basic and Diluted EPS", 10_000_000, 10_000_000, 10_000_000, 10_000_000, 10_000_000])
+    ws.append(["Information Technology and Consultancy Services"])
+
+    xlsx_path = tmp_path / "ifrs_inr_metrics.xlsx"
+    wb.save(str(xlsx_path))
+
+    extracted = dp.extract_structured_financials(str(xlsx_path), "xlsx")
+
+    assert extracted is not None
+    data = extracted["extracted_data"]
+    assert data["reporting_unit"] == "millions"
+    assert data["historical_revenues"] == [
+        1_000_000_000,
+        1_100_000_000,
+        1_210_000_000,
+        1_331_000_000,
+        1_464_100_000,
+    ]
+    assert data["shares_outstanding"] == 10_000_000
+    assert data["cash_and_equivalents"] == 397_000_000
+    assert round(data["historical_ebitda_margins"][-1], 4) == round((372 + 16 + 5) / 1464.1, 4)
+    assert data["industry_sector"] == "IT Services"
+
+
+def test_auditor_auto_approves_structured_spreadsheet_mode():
+    result = AuditorAgent.audit(
+        system_prompt="unused",
+        preparer_output={
+            "extraction_mode": "structured_spreadsheet",
+            "extracted_data": {"historical_revenues": [1, 2, 3]},
+            "audit_trail": [
+                {
+                    "field": "historical_revenues",
+                    "value": [1, 2, 3],
+                    "confidence": 0.95,
+                    "source_citation": "IFRS-PnL,BS-INR row 2",
+                }
+            ],
+            "reconciliation_log": "Structured spreadsheet extraction.",
+        },
+        company_name="Synthetic IT Services Ltd",
+    )
+
+    assert result["overall_status"] == "approved"
+    assert result["field_verdicts"][0]["status"] == "approved"

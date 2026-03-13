@@ -1,27 +1,35 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Depends
+from sqlalchemy.orm import Session
 from typing import List
 import uuid
 
 from models import DealCreate, DealUpdate, APIResponse, APIResponseList, Meta
-from store import store, Deal
+from db_models import DealModel, DocumentModel
+from dependencies import get_db, get_current_user
 
 router = APIRouter(prefix="/deals", tags=["Deals"])
 
 @router.post("", response_model=APIResponse, status_code=status.HTTP_201_CREATED)
-async def create_deal(deal_data: DealCreate):
-    # Create the internal dataclass Deal
-    new_deal = Deal(
+async def create_deal(
+    deal_data: DealCreate, 
+    db: Session = Depends(get_db), 
+    user: dict = Depends(get_current_user)
+):
+    new_deal = DealModel(
+        id=str(uuid.uuid4()),
+        tenant_id=user["tenant_id"],
+        owner_id=user["user_id"],
         name=deal_data.name,
         company_name=deal_data.company_name,
         deal_type=deal_data.deal_type,
         industry=deal_data.industry,
         deal_stage=deal_data.deal_stage,
-        notes=deal_data.notes,
-        id=str(uuid.uuid4())
+        notes=deal_data.notes
     )
     
-    # Save to memory store
-    store.deals[new_deal.id] = new_deal
+    db.add(new_deal)
+    db.commit()
+    db.refresh(new_deal)
     
     response_data = {
         "id": new_deal.id,
@@ -48,29 +56,36 @@ async def list_deals(
     sort: str = "created_at_desc",
     limit: int = 20,
     offset: int = 0,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
 ):
     # Clamp pagination parameters to safe bounds
     limit = max(1, min(limit, 100))
     offset = max(0, offset)
-    all_deals = [d for d in store.deals.values() if not d.is_archived]
+    
+    # Enforce tenant isolation
+    query = db.query(DealModel).filter(
+        DealModel.is_archived == False,
+        DealModel.tenant_id == user["tenant_id"]
+    )
     
     # Filter by deal stage status
     if status_filter != "all":
-        all_deals = [d for d in all_deals if d.deal_stage == status_filter]
+        query = query.filter(DealModel.deal_stage == status_filter)
         
     # Sort
     if sort == "created_at_desc":
-        all_deals.sort(key=lambda d: d.created_at, reverse=True)
+        query = query.order_by(DealModel.created_at.desc())
     elif sort == "created_at_asc":
-        all_deals.sort(key=lambda d: d.created_at, reverse=False)
+        query = query.order_by(DealModel.created_at.asc())
         
-    # Pagination
-    paginated_deals = all_deals[offset : offset + limit]
+    total = query.count()
+    paginated_deals = query.offset(offset).limit(limit).all()
     
     response_list = []
     for deal in paginated_deals:
         # Calculate counts
-        doc_count = len(store.get_documents_for_deal(deal.id))
+        doc_count = db.query(DocumentModel).filter(DocumentModel.deal_id == deal.id).count()
         
         response_list.append({
             "id": deal.id,
@@ -80,14 +95,14 @@ async def list_deals(
             "deal_stage": deal.deal_stage,
             "created_at": deal.created_at.isoformat(),
             "document_count": doc_count,
-            "output_count": 0, # Mocked for now until outputs route is built
+            "output_count": len(deal.outputs) if deal.outputs else 0
         })
         
     return APIResponseList(
         success=True,
         data={
             "deals": response_list,
-            "total": len(all_deals),
+            "total": total,
             "limit": limit,
             "offset": offset
         },
@@ -95,8 +110,17 @@ async def list_deals(
     )
 
 @router.get("/{deal_id}", response_model=APIResponse)
-async def get_deal(deal_id: str):
-    deal = store.get_deal(deal_id)
+async def get_deal(
+    deal_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"],
+        DealModel.is_archived == False
+    ).first()
+    
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
         
@@ -118,8 +142,18 @@ async def get_deal(deal_id: str):
     )
 
 @router.patch("/{deal_id}", response_model=APIResponse)
-async def update_deal(deal_id: str, update_data: DealUpdate):
-    deal = store.get_deal(deal_id)
+async def update_deal(
+    deal_id: str, 
+    update_data: DealUpdate,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"],
+        DealModel.is_archived == False
+    ).first()
+    
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
         
@@ -127,8 +161,8 @@ async def update_deal(deal_id: str, update_data: DealUpdate):
     for key, value in update_dict.items():
         setattr(deal, key, value)
         
-    # Re-save to store
-    store.deals[deal_id] = deal
+    db.commit()
+    db.refresh(deal)
     
     return APIResponse(
         success=True,
@@ -137,13 +171,21 @@ async def update_deal(deal_id: str, update_data: DealUpdate):
     )
 
 @router.delete("/{deal_id}", response_model=APIResponse)
-async def delete_deal(deal_id: str):
-    deal = store.get_deal(deal_id)
+async def delete_deal(
+    deal_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"]
+    ).first()
+    
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
         
     deal.is_archived = True
-    store.deals[deal_id] = deal
+    db.commit()
     
     return APIResponse(
         success=True,

@@ -13,6 +13,7 @@ from engine.llm import ask_llm
 from engine.triangulator import Triangulator
 from engine.comps import ComparableAnalysisEngine
 from engine.financial_statement_analyzer import FinancialStatementAnalyzer
+from tools.document_parser import extract_structured_financials
 from tools.excel_writer import WorkbookBuilder
 from store import store, Output, ExtractionAudit
 
@@ -565,6 +566,58 @@ class FinancialModelingAgent(BaseAgent):
         }
 
     @staticmethod
+    def _build_sector_routing_profile(industry: str, margins: list) -> dict:
+        industry_blob = (industry or "").lower()
+        recent_margins = [
+            float(margin)
+            for margin in (margins or [])[-3:]
+            if isinstance(margin, (int, float))
+        ]
+        recent_margin_average = (
+            sum(recent_margins) / len(recent_margins)
+            if recent_margins
+            else None
+        )
+
+        it_services_markers = (
+            "it services",
+            "technology services",
+            "information technology",
+            "software services",
+            "consultancy services",
+            "it consulting",
+        )
+
+        if any(marker in industry_blob for marker in it_services_markers):
+            return {
+                "sector": "it_services",
+                "margin_floor": 0.20,
+                "margin_baseline_override": max(recent_margin_average or 0.0, 0.20),
+                "da_cap_percent_rev": 0.02,
+                "capex_cap_percent_rev": 0.03,
+                "nwc_method": "percent_revenue_balance",
+                "nwc_percent_rev": -0.01,
+                "min_projection_years": 7,
+                "reasons": [
+                    "sector routing: IT services baseline enabled",
+                    "margin anchored to recent operating history with 20% floor",
+                    "working capital modeled as -1% of revenue balance (<=0% change on growth)",
+                ],
+            }
+
+        return {
+            "sector": "generic",
+            "margin_floor": None,
+            "margin_baseline_override": None,
+            "da_cap_percent_rev": None,
+            "capex_cap_percent_rev": None,
+            "nwc_method": "days",
+            "nwc_percent_rev": None,
+            "min_projection_years": 5,
+            "reasons": [],
+        }
+
+    @staticmethod
     def _extract_cin(text: str) -> Optional[str]:
         if not text:
             return None
@@ -683,6 +736,33 @@ class FinancialModelingAgent(BaseAgent):
             "If a value is not found with citation, return null and explain briefly in reconciliation_log.\n"
             "Do not fabricate values.\n"
         )
+
+    def _extract_structured_spreadsheet_payload(self) -> Optional[dict]:
+        best_payload = None
+        best_score = -1
+
+        for doc in store.get_documents_for_deal(self.deal_id):
+            structured = extract_structured_financials(doc.storage_path, doc.file_type)
+            if not structured:
+                continue
+
+            extracted_data = structured.get("extracted_data", {})
+            score = sum(
+                1
+                for field in (
+                    "historical_revenues",
+                    "historical_ebitda_margins",
+                    "cash_and_equivalents",
+                    "total_borrowings",
+                    "shares_outstanding",
+                )
+                if extracted_data.get(field) not in (None, [], {})
+            )
+            if score > best_score:
+                best_score = score
+                best_payload = {**structured, "source_document": doc.filename}
+
+        return best_payload
 
     @classmethod
     def _build_extraction_checkpoint(
@@ -949,67 +1029,81 @@ class FinancialModelingAgent(BaseAgent):
         preparer_output = {}
         auditor_status = "skipped"
 
+        structured_payload = self._extract_structured_spreadsheet_payload()
+        if structured_payload:
+            preparer_output = structured_payload
+            llm_data = structured_payload.get("extracted_data", {})
+            extraction_audit_trail = structured_payload.get("audit_trail", [])
+            extraction_mode = structured_payload.get("extraction_mode", "structured_spreadsheet")
+            self.observe(
+                "Structured spreadsheet extraction captured "
+                f"{len(llm_data)} fields from {structured_payload.get('source_document', 'spreadsheet document')}."
+            )
+
         max_extraction_retries = max(1, int(params.get("extraction_retry_limit") or 2))
         quality_threshold = float(params.get("extraction_quality_threshold") or 0.70)
         best_quality_score = -1.0
         best_payload = None
         current_context = full_context
-        self.think("[Stage 1/3] Running preparer extraction with evaluator-optimizer retries.")
+        if not llm_data:
+            self.think("[Stage 1/3] Running preparer extraction with evaluator-optimizer retries.")
 
-        for attempt in range(1, max_extraction_retries + 1):
-            self.act("preparer_agent", f"Attempt {attempt}: extracting with citations and confidence scores")
-            try:
-                attempt_output = PreparerAgent.extract(
-                    system_prompt=self.system_prompt,
-                    document_context=current_context,
-                    params=params,
-                    company_name=company_name,
-                )
-                attempt_data = attempt_output.get("extracted_data", {})
-                attempt_audit = attempt_output.get("audit_trail", [])
-                attempt_mode = attempt_output.get("extraction_mode", "llm")
+            for attempt in range(1, max_extraction_retries + 1):
+                self.act("preparer_agent", f"Attempt {attempt}: extracting with citations and confidence scores")
+                try:
+                    attempt_output = PreparerAgent.extract(
+                        system_prompt=self.system_prompt,
+                        document_context=current_context,
+                        params=params,
+                        company_name=company_name,
+                    )
+                    attempt_data = attempt_output.get("extracted_data", {})
+                    attempt_audit = attempt_output.get("audit_trail", [])
+                    attempt_mode = attempt_output.get("extraction_mode", "llm")
 
-                quality = self._summarize_preparer_quality(attempt_audit, attempt_data)
-                quality_score = quality["quality_score"]
+                    quality = self._summarize_preparer_quality(attempt_audit, attempt_data)
+                    quality_score = quality["quality_score"]
 
+                    self.observe(
+                        f"Preparer attempt {attempt}: fields={len(attempt_data)}, "
+                        f"audit={len(attempt_audit)}, quality={quality_score:.2f}."
+                    )
+
+                    if quality_score > best_quality_score:
+                        best_quality_score = quality_score
+                        best_payload = {
+                            "preparer_output": attempt_output,
+                            "llm_data": attempt_data,
+                            "audit_trail": attempt_audit,
+                            "extraction_mode": attempt_mode,
+                            "quality": quality,
+                        }
+
+                    is_fallback_attempt = str(attempt_mode).lower() == "deterministic_fallback"
+                    if quality_score >= quality_threshold or is_fallback_attempt:
+                        break
+
+                    if has_uploaded_documents:
+                        retry_guidance = self._build_retry_guidance(quality, attempt + 1)
+                        current_context = full_context + retry_guidance
+                except Exception as exc:
+                    self.observe(f"Preparer attempt {attempt} failed ({exc}).")
+
+            if best_payload:
+                preparer_output = best_payload["preparer_output"]
+                llm_data = best_payload["llm_data"]
+                extraction_audit_trail = best_payload["audit_trail"]
+                extraction_mode = best_payload["extraction_mode"]
+                fallback_mode = str(extraction_mode).lower() == "deterministic_fallback"
+                fallback_profile = str(llm_data.get("fallback_profile", ""))
                 self.observe(
-                    f"Preparer attempt {attempt}: fields={len(attempt_data)}, "
-                    f"audit={len(attempt_audit)}, quality={quality_score:.2f}."
+                    f"Selected extraction payload with quality={best_payload['quality']['quality_score']:.2f} "
+                    f"(threshold={quality_threshold:.2f})."
                 )
-
-                if quality_score > best_quality_score:
-                    best_quality_score = quality_score
-                    best_payload = {
-                        "preparer_output": attempt_output,
-                        "llm_data": attempt_data,
-                        "audit_trail": attempt_audit,
-                        "extraction_mode": attempt_mode,
-                        "quality": quality,
-                    }
-
-                is_fallback_attempt = str(attempt_mode).lower() == "deterministic_fallback"
-                if quality_score >= quality_threshold or is_fallback_attempt:
-                    break
-
-                if has_uploaded_documents:
-                    retry_guidance = self._build_retry_guidance(quality, attempt + 1)
-                    current_context = full_context + retry_guidance
-            except Exception as exc:
-                self.observe(f"Preparer attempt {attempt} failed ({exc}).")
-
-        if best_payload:
-            preparer_output = best_payload["preparer_output"]
-            llm_data = best_payload["llm_data"]
-            extraction_audit_trail = best_payload["audit_trail"]
-            extraction_mode = best_payload["extraction_mode"]
-            fallback_mode = str(extraction_mode).lower() == "deterministic_fallback"
-            fallback_profile = str(llm_data.get("fallback_profile", ""))
-            self.observe(
-                f"Selected extraction payload with quality={best_payload['quality']['quality_score']:.2f} "
-                f"(threshold={quality_threshold:.2f})."
-            )
+            else:
+                llm_data = {}
         else:
-            llm_data = {}
+            self.observe("Skipping LLM preparer because structured spreadsheet extraction already supplied core fields.")
 
         if not llm_data:
             self.observe("Preparer returned no usable data. Retrying with legacy extraction prompt.")
@@ -1307,6 +1401,30 @@ class FinancialModelingAgent(BaseAgent):
                 if llm_industry:
                     risk_overlay = self._infer_public_company_risk_overlay(llm_industry, historical_ebitda_margins)
                     self.observe(f"Using LLM-extracted industry '{llm_industry}' for risk overlay (deal metadata empty).")
+            else:
+                llm_industry = str(llm_data.get("industry_sector", "")).strip()
+
+            sector_routing_industry = " ".join(
+                part for part in [str(deal_industry or "").strip(), llm_industry] if part
+            )
+            sector_routing = self._build_sector_routing_profile(
+                sector_routing_industry,
+                historical_ebitda_margins,
+            )
+            if sector_routing.get("reasons"):
+                self.observe(
+                    "Sector routing applied for "
+                    f"{sector_routing.get('sector', 'generic')}: "
+                    + "; ".join(sector_routing["reasons"])
+                )
+                data_sources.append(
+                    "sector_routing: "
+                    + sector_routing.get("sector", "generic").replace("_", " ")
+                )
+
+            is_it_services_company = any(
+                "IT services sector" in reason for reason in risk_overlay.get("reasons", [])
+            ) or sector_routing.get("sector") == "it_services"
 
             # ── Large-cap revenue guard ────────────────────────────────────────────────
             # Companies with consolidated revenue ≥ ₹50,000 Crore are exchange-traded
@@ -1515,6 +1633,16 @@ class FinancialModelingAgent(BaseAgent):
             da_percent_rev, source = self._resolve("da_percent_rev", params, llm_data, generic_defaults, label="da_percent_rev")
             data_sources.append(source)
             da_percent_rev = da_percent_rev if da_percent_rev is not None else 0.056
+            da_cap = sector_routing.get("da_cap_percent_rev")
+            if da_cap is not None and params.get("da_percent_rev") is None and da_percent_rev > da_cap:
+                self.observe(
+                    "Sector routing D&A cap applied: "
+                    f"{da_percent_rev * 100:.2f}% -> {da_cap * 100:.2f}% of revenue."
+                )
+                da_percent_rev = da_cap
+                data_sources.append(
+                    f"da_percent_rev: capped at {da_cap * 100:.1f}% for {sector_routing.get('sector', 'sector profile')}"
+                )
 
             cap_ex_percent_rev, source = self._resolve(
                 "cap_ex_percent_rev",
@@ -1546,6 +1674,21 @@ class FinancialModelingAgent(BaseAgent):
                 else:
                     cap_ex_percent_rev = 0.03
                     data_sources.append("cap_ex_percent_rev: 3% generic default")
+            capex_cap = sector_routing.get("capex_cap_percent_rev")
+            if (
+                capex_cap is not None
+                and params.get("cap_ex_percent_rev") is None
+                and cap_ex_percent_rev is not None
+                and cap_ex_percent_rev > capex_cap
+            ):
+                self.observe(
+                    "Sector routing CapEx cap applied: "
+                    f"{cap_ex_percent_rev * 100:.2f}% -> {capex_cap * 100:.2f}% of revenue."
+                )
+                cap_ex_percent_rev = capex_cap
+                data_sources.append(
+                    f"cap_ex_percent_rev: capped at {capex_cap * 100:.1f}% for {sector_routing.get('sector', 'sector profile')}"
+                )
 
             revenue_cagr_override, source = self._resolve(
                 "revenue_cagr_override",
@@ -1572,15 +1715,28 @@ class FinancialModelingAgent(BaseAgent):
                 revenue_cagr_override = params["revenue_cagr_override_auto"]
                 data_sources.append(f"revenue_cagr_override: auto-capped to {revenue_cagr_override * 100:.1f}%")
 
+            nwc_method = str(
+                params.get("nwc_method")
+                or sector_routing.get("nwc_method")
+                or "days"
+            ).strip().lower()
+            data_sources.append(f"nwc_method: {nwc_method}")
+
             # NWC: large-cap companies run leaner working capital as % of revenue.
             # ≥ ₹50,000 Cr revenue → 5%; smaller companies → 10% generic default.
-            if params.get("nwc_percent_rev"):
+            if params.get("nwc_percent_rev") is not None:
                 nwc_percent_rev = float(params["nwc_percent_rev"])
+                data_sources.append("nwc_percent_rev: user override")
             else:
                 _max_rev_nwc = max(historical_revenues) if historical_revenues else 0
-                if _max_rev_nwc >= 500_000_000_000:    # ≥ ₹50,000 Crore
+                if sector_routing.get("nwc_percent_rev") is not None:
+                    nwc_percent_rev = float(sector_routing["nwc_percent_rev"])
+                    data_sources.append(
+                        f"nwc_percent_rev: {nwc_percent_rev * 100:.1f}% sector routing default"
+                    )
+                elif _max_rev_nwc >= 500_000_000_000:
                     nwc_percent_rev = 0.05
-                    data_sources.append("nwc_percent_rev: 5% (large-cap ≥ ₹50,000 Cr)")
+                    data_sources.append("nwc_percent_rev: 5% (large-cap >= Rs50,000 Cr)")
                 else:
                     nwc_percent_rev = 0.10
                     data_sources.append("nwc_percent_rev: 10% generic default")
@@ -1592,6 +1748,14 @@ class FinancialModelingAgent(BaseAgent):
             dso = float(params.get("dso") or 45.0)
             dpo = float(params.get("dpo") or 30.0)
             dio = float(params.get("dio") or 30.0)
+            if is_it_services_company:
+                if not params.get("dso"):
+                    dso = 35.0
+                if not params.get("dpo"):
+                    dpo = 45.0
+                if not params.get("dio"):
+                    dio = 0.0
+                data_sources.append("working_capital_days: IT services defaults (DSO 35 / DPO 45 / DIO 0)")
 
             ebitda_margin_override = params.get("ebitda_margin_override")
             if ebitda_margin_override:
@@ -1599,6 +1763,13 @@ class FinancialModelingAgent(BaseAgent):
                 if margin_value > 1.0:
                     margin_value = margin_value / 100.0
                 historical_ebitda_margins = [margin_value] * len(historical_ebitda_margins)
+
+            margin_baseline_override = sector_routing.get("margin_baseline_override")
+            if margin_baseline_override is not None and params.get("ebitda_margin_override") is None:
+                data_sources.append(
+                    "margin_baseline_override: "
+                    f"{margin_baseline_override * 100:.1f}% sector routing baseline"
+                )
 
             avg_margin = sum(historical_ebitda_margins) / len(historical_ebitda_margins)
             latest_margin = historical_ebitda_margins[-1]
@@ -1634,7 +1805,10 @@ class FinancialModelingAgent(BaseAgent):
             projection_years = int(params.get("projection_years") or 5)
 
             # Industry-aware minimum projection years
-            industry_min_years = risk_overlay.get("min_projection_years", 5)
+            industry_min_years = max(
+                risk_overlay.get("min_projection_years", 5),
+                sector_routing.get("min_projection_years", 5),
+            )
             if projection_years < industry_min_years and not params.get("projection_years"):
                 self.observe(
                     f"Industry overlay requires {industry_min_years}+ year forecast; "
@@ -1669,9 +1843,11 @@ class FinancialModelingAgent(BaseAgent):
                 da_percent_rev=da_percent_rev,
                 cap_ex_percent_rev=cap_ex_percent_rev,
                 revenue_cagr_override=revenue_cagr_override,
+                margin_baseline_override=margin_baseline_override,
                 nwc_percent_rev=nwc_percent_rev,
                 base_fy=base_fy,
                 tax_loss_carryforward=tax_loss_carryforward,
+                nwc_method=nwc_method,
                 dso=dso,
                 dpo=dpo,
                 dio=dio,
@@ -1690,6 +1866,11 @@ class FinancialModelingAgent(BaseAgent):
                 net_debt=net_debt,
                 shares_outstanding=shares_for_valuation,
             )
+            projections_data["assumptions"]["sector_routing"] = {
+                "industry_source": sector_routing_industry or None,
+                "profile": sector_routing.get("sector", "generic"),
+                "reasons": sector_routing.get("reasons", []),
+            }
             self.observe("DCF computed successfully.")
 
             private_adjustment_factor = 1.0
@@ -1730,7 +1911,7 @@ class FinancialModelingAgent(BaseAgent):
             comps_engine = ComparableAnalysisEngine()
             latest_revenue_for_comps = historical_revenues[-1] if historical_revenues else 0.0
             avg_margin_for_comps = (
-                sum(historical_ebitda_margins) / len(historical_ebitda_margins)
+                projections_data["assumptions"].get("avg_ebitda_margin")
                 if historical_ebitda_margins
                 else 0.10
             )
@@ -1975,6 +2156,7 @@ class FinancialModelingAgent(BaseAgent):
                 "audit_trail": audit_trail_summary,
                 "triangulation": triangulation_result,
                 "company_classification": company_context,
+                "sector_routing": projections_data["assumptions"].get("sector_routing", {}),
                 "key_field_status": {
                     "shares_verified": shares_for_valuation is not None,
                     "per_share_value_available": shares_for_valuation is not None and not is_private_company,
@@ -2010,6 +2192,12 @@ class FinancialModelingAgent(BaseAgent):
                 warnings.append(
                     "PUBLIC RISK OVERLAY APPLIED: "
                     + "; ".join(risk_overlay["reasons"])
+                    + "."
+                )
+            if sector_routing.get("reasons"):
+                warnings.append(
+                    "SECTOR ROUTING APPLIED: "
+                    + "; ".join(sector_routing["reasons"])
                     + "."
                 )
             if tax_loss_carryforward > 0:

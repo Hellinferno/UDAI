@@ -3,7 +3,8 @@ import uuid
 import time
 from typing import Dict, Any, List
 
-from store import store, AgentRun
+from database import SessionLocal
+from db_models import AgentRunModel
 
 logger = logging.getLogger(__name__)
 
@@ -17,25 +18,55 @@ class BaseAgent:
         
         # Initialize run tracking
         self.run_id = str(uuid.uuid4())
-        self.run_record = AgentRun(
-            id=self.run_id,
-            deal_id=self.deal_id,
-            agent_type=self.agent_type,
-            task_name=self.task_name,
-            status="running",
-            input_payload=self.input_payload
-        )
-        store.agent_runs[self.run_id] = self.run_record
+        
+        with SessionLocal() as db:
+            self.run_record = AgentRunModel(
+                id=self.run_id,
+                deal_id=self.deal_id,
+                agent_type=self.agent_type,
+                task_name=self.task_name,
+                status="running",
+                input_payload=self.input_payload,
+                reasoning_steps=[]
+            )
+            db.add(self.run_record)
+            db.commit()
+
+    def _sync_to_db(self):
+        """Helper to sync current state to database."""
+        with SessionLocal() as db:
+            db_record = db.query(AgentRunModel).get(self.run_id)
+            if db_record:
+                # Using SQLAlchemy JSON columns requires reassignment for modification tracking sometimes
+                db_record.reasoning_steps = list(self.run_record.reasoning_steps)
+                db_record.status = self.run_record.status
+                db_record.input_payload = dict(self.run_record.input_payload)
+                db_record.confidence_score = self.run_record.confidence_score
+                db_record.error_message = self.run_record.error_message
+                db.commit()
 
     def _log_step(self, step_type: str, content: str):
         """Append a step to the reasoning logs."""
         step_number = len(self.run_record.reasoning_steps) + 1
-        self.run_record.reasoning_steps.append({
+        new_step = {
             "step": step_number,
             "type": step_type,
             "content": content
-        })
+        }
+        # Explicit copy to force JSON change detection
+        steps_copy = list(self.run_record.reasoning_steps)
+        steps_copy.append(new_step)
+        self.run_record.reasoning_steps = steps_copy
+        
+        self._sync_to_db()
         logger.debug("[%s] %s: %s", self.agent_type, step_type.upper(), content)
+
+    def update_payload(self, key: str, value: Any):
+        """Safely update input_payload for persistence."""
+        payload_copy = dict(self.run_record.input_payload)
+        payload_copy[key] = value
+        self.run_record.input_payload = payload_copy
+        self._sync_to_db()
 
     def think(self, context: str):
         self._log_step("thought", context)
@@ -50,11 +81,13 @@ class BaseAgent:
         self.run_record.status = "completed"
         self.run_record.confidence_score = confidence
         self._log_step("completion", "Task completed successfully.")
+        self._sync_to_db()
 
     def fail(self, error_message: str):
         self.run_record.status = "failed"
         self.run_record.error_message = error_message
         self._log_step("error", error_message)
+        self._sync_to_db()
 
     def run(self):
         """Abstract method to be overridden by subclasses."""

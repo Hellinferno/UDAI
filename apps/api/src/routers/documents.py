@@ -3,11 +3,14 @@ import re
 import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, status
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, status, Depends
+from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from models import APIResponse, Meta
-from store import store, Document
+from db_models import DealModel, DocumentModel
+from dependencies import get_db, get_current_user
+from database import SessionLocal
 from tools.document_parser import parse_document
 
 # Background parser pool: same as startup recovery
@@ -37,17 +40,21 @@ _SAFE_NAME_RE = re.compile(r"[^a-z0-9_.\-]")
 
 
 def _parse_document_async(file_id: str, file_path: str, file_type: str):
-    """Parse document in background and update store status."""
+    """Parse document in background and update database status."""
     try:
         parsed_text = parse_document(file_path, file_type)
-        doc = store.documents.get(file_id)
-        if doc:
-            doc.parsed_text = parsed_text
-            doc.parse_status = "parsed" if parsed_text else "parse_failed"
+        with SessionLocal() as db:
+            doc = db.query(DocumentModel).get(file_id)
+            if doc:
+                doc.parsed_text = parsed_text
+                doc.parse_status = "parsed" if parsed_text else "parse_failed"
+                db.commit()
     except Exception as exc:
-        doc = store.documents.get(file_id)
-        if doc:
-            doc.parse_status = "parse_failed"
+        with SessionLocal() as db:
+            doc = db.query(DocumentModel).get(file_id)
+            if doc:
+                doc.parse_status = "parse_failed"
+                db.commit()
         print(f"[PARSE_ERROR] {file_id}: {exc}")
 
 
@@ -73,8 +80,13 @@ async def upload_documents(
     deal_id: str,
     files: List[UploadFile] = File(...),
     category: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
 ):
-    deal = store.get_deal(deal_id)
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"]
+    ).first()
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
@@ -129,7 +141,7 @@ async def upload_documents(
             print(f"[UPLOAD] OSError saving {safe_filename}: {exc}")
             continue
 
-        new_doc = Document(
+        new_doc = DocumentModel(
             id=file_id,
             deal_id=deal_id,
             filename=safe_filename,
@@ -139,7 +151,9 @@ async def upload_documents(
             doc_category=category,
             parse_status="parsing",
         )
-        store.documents[file_id] = new_doc
+        db.add(new_doc)
+        db.commit()
+        db.refresh(new_doc)
 
         # Queue parsing to run in background thread pool
         # This prevents the upload response from being blocked
@@ -166,12 +180,19 @@ async def upload_documents(
 
 
 @router.get("", response_model=APIResponse)
-async def list_documents(deal_id: str):
-    deal = store.get_deal(deal_id)
+async def list_documents(
+    deal_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"]
+    ).first()
     if not deal:
         raise HTTPException(status_code=404, detail="Deal not found")
 
-    docs = store.get_documents_for_deal(deal_id)
+    docs = db.query(DocumentModel).filter(DocumentModel.deal_id == deal_id).all()
     return APIResponse(
         success=True,
         data=[
@@ -191,9 +212,25 @@ async def list_documents(deal_id: str):
 
 
 @router.delete("/{doc_id}", response_model=APIResponse)
-async def delete_document(deal_id: str, doc_id: str):
-    doc = store.documents.get(doc_id)
-    if not doc or doc.deal_id != deal_id:
+async def delete_document(
+    deal_id: str, 
+    doc_id: str,
+    db: Session = Depends(get_db),
+    user: dict = Depends(get_current_user)
+):
+    deal = db.query(DealModel).filter(
+        DealModel.id == deal_id,
+        DealModel.tenant_id == user["tenant_id"]
+    ).first()
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    doc = db.query(DocumentModel).filter(
+        DocumentModel.id == doc_id,
+        DocumentModel.deal_id == deal_id
+    ).first()
+    
+    if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
     # Delete from filesystem
@@ -205,7 +242,8 @@ async def delete_document(deal_id: str, doc_id: str):
     except (ValueError, OSError):
         pass  # Log but don't expose internals
 
-    del store.documents[doc_id]
+    db.delete(doc)
+    db.commit()
 
     return APIResponse(
         success=True,

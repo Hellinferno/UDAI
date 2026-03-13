@@ -43,3 +43,9 @@ reportlab>=4.4.0
 
 # ── Configuration ────────────────────────────────────────────────
 python-dotenv>=1.2.0
+
+# ── Database & ORM ───────────────────────────────────────────────
+sqlalchemy>=2.0.30
+alembic>=1.13.1
+psycopg2-binary>=2.9.9
+

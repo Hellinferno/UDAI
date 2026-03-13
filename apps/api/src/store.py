@@ -3,10 +3,13 @@ from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 import uuid
 
+# We keep the Pydantic/dataclasses strictly for type hints where agents expect them.
+# The store will now act as a facade over DB.
+from database import SessionLocal
+from db_models import DealModel, DocumentModel, AgentRunModel, OutputModel, ExtractionAuditModel, TaskModel
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
 
 @dataclass
 class Output:
@@ -23,7 +26,6 @@ class Output:
 
 @dataclass
 class ExtractionAudit:
-    """Per-field audit trail for the maker-checker extraction pipeline."""
     deal_id: str = ""
     agent_run_id: str = ""
     field_name: str = ""
@@ -91,27 +93,90 @@ class Deal:
 
 
 # ---------------------------------------------------------------------------
-# Global In-Memory Store
+# Global In-Memory Store Facade (Migrating to SessionLocal)
 # ---------------------------------------------------------------------------
+
+class DictFacade:
+    def __init__(self, model_class, dataclass_type):
+        self.model_class = model_class
+        self.dataclass_type = dataclass_type
+        
+    def _to_dataclass(self, orm_obj):
+        if not orm_obj: return None
+        d = {}
+        for c in orm_obj.__table__.columns:
+            d[c.name] = getattr(orm_obj, c.name)
+        # Drop DB-only cols not in dataclass
+        valid_keys = self.dataclass_type.__dataclass_fields__.keys()
+        filtered = {k: v for k, v in d.items() if k in valid_keys}
+        return self.dataclass_type(**filtered)
+
+    def _to_orm(self, dc_obj):
+        d = vars(dc_obj)
+        return self.model_class(**d)
+
+    def get(self, key, default=None):
+        with SessionLocal() as db:
+            obj = db.query(self.model_class).get(key)
+            return self._to_dataclass(obj) if obj else default
+
+    def __getitem__(self, key):
+        res = self.get(key)
+        if not res: raise KeyError(key)
+        return res
+
+    def __setitem__(self, key, value):
+        with SessionLocal() as db:
+            # Check if exists
+            obj = db.query(self.model_class).get(key)
+            if obj:
+                for k, v in vars(value).items():
+                    if hasattr(obj, k):
+                        setattr(obj, k, v)
+            else:
+                db.add(self._to_orm(value))
+            db.commit()
+
+    def __delitem__(self, key):
+        with SessionLocal() as db:
+            obj = db.query(self.model_class).get(key)
+            if obj:
+                db.delete(obj)
+                db.commit()
+            else:
+                raise KeyError(key)
+
+    def __contains__(self, key):
+        with SessionLocal() as db:
+            return db.query(self.model_class).get(key) is not None
+
+    def values(self):
+        with SessionLocal() as db:
+            objs = db.query(self.model_class).all()
+            return [self._to_dataclass(o) for o in objs]
+
+    def clear(self):
+        with SessionLocal() as db:
+            db.query(self.model_class).delete()
+            db.commit()
 
 class MemoryStore:
     def __init__(self):
-        self.deals: Dict[str, Deal] = {}
-        self.documents: Dict[str, Document] = {}
-        self.agent_runs: Dict[str, AgentRun] = {}
-        self.outputs: Dict[str, Output] = {}
-        self.tasks: Dict[str, Task] = {}
-        self.extraction_audits: Dict[str, List[ExtractionAudit]] = {}
+        self.deals = DictFacade(DealModel, Deal)
+        self.documents = DictFacade(DocumentModel, Document)
+        self.agent_runs = DictFacade(AgentRunModel, AgentRun)
+        self.outputs = DictFacade(OutputModel, Output)
+        self.tasks = DictFacade(TaskModel, Task)
+        self.extraction_audits = DictFacade(ExtractionAuditModel, ExtractionAudit)
 
     def get_deal(self, deal_id: str) -> Optional[Deal]:
         deal = self.deals.get(deal_id)
-        if deal and not deal.is_archived:
+        if deal and not getattr(deal, "is_archived", False):
             return deal
         return None
 
     def get_documents_for_deal(self, deal_id: str) -> List[Document]:
-        return [doc for doc in self.documents.values() if doc.deal_id == deal_id]
+        return [doc for doc in self.documents.values() if getattr(doc, "deal_id", None) == deal_id]
 
-
-# Singleton instance
 store = MemoryStore()
+

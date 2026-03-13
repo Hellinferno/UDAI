@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 
 from dotenv import load_dotenv
 from google import genai
@@ -11,8 +12,20 @@ from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponen
 
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+
+def _load_env_files() -> None:
+    """Load env files from stable project locations instead of relying on CWD."""
+    env_candidates = [
+        Path(__file__).resolve().parents[2] / ".env",
+        Path.cwd() / ".env",
+    ]
+
+    for env_path in env_candidates:
+        if env_path.exists():
+            load_dotenv(dotenv_path=env_path, override=False)
+
+
+_load_env_files()
 
 # Check if API keys are available
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -90,8 +103,8 @@ def ask_llm(system_prompt: str, user_prompt: str) -> str:
     If Gemini fails entirely, uses NVIDIA DeepSeek fallback.
     """
     if not GEMINI_API_KEY and not NVIDIA_API_KEY:
-        logger.info("[LLM Engine] No API keys configured, using deterministic fallback")
-        return _get_deterministic_fallback_response(user_prompt)
+        logger.error("[LLM Engine] No API keys configured")
+        raise RuntimeError("No API keys found. For production readiness, fallback has been disabled. Please configure GEMINI_API_KEY.")
 
     try:
         if gemini_client:
@@ -99,8 +112,8 @@ def ask_llm(system_prompt: str, user_prompt: str) -> str:
         raise Exception("Gemini API key not configured")
     except Exception as e_gemini:
         if _is_quota_or_rate_limit_error(e_gemini):
-            logger.warning("[LLM Engine] Primary LLM quota/rate limit: %s", _sanitize_error(e_gemini))
-            return _get_deterministic_fallback_response(user_prompt)
+            logger.error("[LLM Engine] Primary LLM quota/rate limit: %s", _sanitize_error(e_gemini))
+            raise RuntimeError(f"Rate limit or quota exceeded: {_sanitize_error(e_gemini)}")
 
         logger.warning("[LLM Engine] Primary LLM failed: %s. Attempting fallback.", _sanitize_error(e_gemini))
 
@@ -122,9 +135,10 @@ def ask_llm(system_prompt: str, user_prompt: str) -> str:
                 return completion.choices[0].message.content
             except Exception as e_nvidia:
                 logger.error("[LLM Engine] Fallback LLM also failed: %s", _sanitize_error(e_nvidia))
+                raise RuntimeError(f"Both primary and fallback LLMs failed: {e_gemini} | {e_nvidia}")
 
-        logger.warning("[LLM Engine] Using deterministic fallback response")
-        return _get_deterministic_fallback_response(user_prompt)
+        logger.error("[LLM Engine] LLM failed and no alternative client configured")
+        raise RuntimeError(f"Primary LLM failed: {_sanitize_error(e_gemini)}")
 
 
 def _build_generic_fallback_profile() -> dict:
