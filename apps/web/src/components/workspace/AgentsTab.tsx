@@ -7,26 +7,138 @@ import {
     type AgentRunResult,
     type ValuationResult,
 } from '../../lib/api'
-import { Play, AlertCircle } from 'lucide-react'
+import { Play, AlertCircle, ChevronRight } from 'lucide-react'
 import DCFResultsView from './DCFResultsView'
+import LBOResultsView from './LBOResultsView'
 import ExtractionAuditPanel from './ExtractionAuditPanel'
 
 interface Props { dealId: string }
 
+// ---- Agent Registry --------------------------------------------------------
+
+interface AgentParam {
+    key: string
+    label: string
+    type: 'number' | 'text'
+    placeholder: string
+    defaultValue: string | number
+}
+
+interface AgentConfig {
+    id: string
+    label: string
+    agentType: string
+    taskName: string
+    badge: string
+    description: string
+    params: AgentParam[]
+}
+
+const AGENT_CONFIGS: AgentConfig[] = [
+    {
+        id: 'dcf',
+        label: 'DCF Model',
+        agentType: 'modeling',
+        taskName: 'dcf_model',
+        badge: 'DCF',
+        description: 'Discounted Cash Flow valuation · Preparer → Auditor → Triangulator → DCF Engine',
+        params: [
+            { key: 'projection_years', label: 'PROJECTION YEARS', type: 'number', placeholder: '5', defaultValue: 5 },
+            { key: 'terminal_growth_rate', label: 'TERMINAL GROWTH', type: 'number', placeholder: '0.025', defaultValue: 0.025 },
+            { key: 'wacc_override', label: 'WACC OVERRIDE', type: 'text', placeholder: '—', defaultValue: '' },
+            { key: 'current_market_cap', label: 'CURRENT MARKET CAP', type: 'text', placeholder: 'Optional', defaultValue: '' },
+            { key: 'current_share_price', label: 'CURRENT SHARE PRICE', type: 'text', placeholder: 'Optional', defaultValue: '' },
+        ],
+    },
+    {
+        id: 'lbo',
+        label: 'LBO Model',
+        agentType: 'modeling',
+        taskName: 'lbo_model',
+        badge: 'LBO',
+        description: 'Leveraged Buyout analysis · Extract → LBO Engine → IRR/MOIC · Sources & Uses → Debt Schedule',
+        params: [
+            { key: 'entry_ev_ebitda', label: 'ENTRY EV/EBITDA', type: 'number', placeholder: '8.0', defaultValue: 8.0 },
+            { key: 'exit_ev_ebitda', label: 'EXIT EV/EBITDA', type: 'number', placeholder: '10.0', defaultValue: 10.0 },
+            { key: 'equity_contribution_pct', label: 'EQUITY CONTRIBUTION %', type: 'number', placeholder: '0.40', defaultValue: 0.40 },
+            { key: 'senior_debt_ebitda', label: 'SENIOR DEBT (x EBITDA)', type: 'number', placeholder: '3.0', defaultValue: 3.0 },
+            { key: 'projection_years', label: 'HOLD PERIOD (YRS)', type: 'number', placeholder: '5', defaultValue: 5 },
+        ],
+    },
+    {
+        id: 'pitchbook',
+        label: 'Pitchbook',
+        agentType: 'pitchbook',
+        taskName: 'generate_pitchbook',
+        badge: 'PDF',
+        description: 'Executive summary pitch deck · Company Overview → Industry → Financials → Valuation',
+        params: [],
+    },
+    {
+        id: 'dd',
+        label: 'Due Diligence',
+        agentType: 'due_diligence',
+        taskName: 'dd_report',
+        badge: 'DD',
+        description: 'Risk assessment report · Financial → Operational → Legal → Market risks + Red Flags',
+        params: [],
+    },
+    {
+        id: 'research',
+        label: 'Market Research',
+        agentType: 'research',
+        taskName: 'industry_brief',
+        badge: 'Research',
+        description: 'Industry brief PDF + Buyer universe JSON · Market sizing → Competitive landscape → Buyers',
+        params: [],
+    },
+    {
+        id: 'cim',
+        label: 'CIM Draft',
+        agentType: 'doc_drafter',
+        taskName: 'cim_draft',
+        badge: 'DOCX',
+        description: 'Confidential Information Memorandum · 5 sections drafted from uploaded documents',
+        params: [],
+    },
+    {
+        id: 'coordination',
+        label: 'Meeting Notes',
+        agentType: 'coordination',
+        taskName: 'extract_tasks',
+        badge: 'Tasks',
+        description: 'Extract action items, decisions, and follow-ups from meeting notes and documents',
+        params: [],
+    },
+]
+
+// ---- Component -------------------------------------------------------------
+
 export default function AgentsTab({ dealId }: Props) {
+    const [selectedAgentId, setSelectedAgentId] = useState<string>('dcf')
+    const [paramValues, setParamValues] = useState<Record<string, Record<string, string | number>>>({})
+
     const [deploying, setDeploying] = useState(false)
     const [result, setResult] = useState<AgentRunResult | null>(null)
     const [valuation, setValuation] = useState<ValuationResult | null>(null)
+    const [lboResult, setLboResult] = useState<Record<string, unknown> | null>(null)
     const [error, setError] = useState('')
     const [activeRunId, setActiveRunId] = useState<string | null>(null)
     const [documentsReady, setDocumentsReady] = useState(true)
     const [documentStatusNote, setDocumentStatusNote] = useState('')
 
-    const [projectionYears, setProjectionYears] = useState(5)
-    const [terminalGrowth, setTerminalGrowth] = useState(0.025)
-    const [waccOverride, setWaccOverride] = useState('')
-    const [currentMarketCap, setCurrentMarketCap] = useState('')
-    const [currentSharePrice, setCurrentSharePrice] = useState('')
+    const selectedAgent = AGENT_CONFIGS.find(a => a.id === selectedAgentId) ?? AGENT_CONFIGS[0]
+
+    // Initialise param values for an agent if not already set
+    const getParamValue = (agentId: string, paramKey: string, defaultValue: string | number) => {
+        return paramValues[agentId]?.[paramKey] ?? defaultValue
+    }
+    const setParamValue = (agentId: string, paramKey: string, value: string | number) => {
+        setParamValues(prev => ({
+            ...prev,
+            [agentId]: { ...prev[agentId], [paramKey]: value },
+        }))
+    }
 
     const refreshDocumentReadiness = useCallback(async () => {
         try {
@@ -49,27 +161,26 @@ export default function AgentsTab({ dealId }: Props) {
         }
     }, [dealId])
 
-    useEffect(() => {
-        refreshDocumentReadiness()
-    }, [refreshDocumentReadiness])
+    useEffect(() => { refreshDocumentReadiness() }, [refreshDocumentReadiness])
 
     useEffect(() => {
         if (documentsReady) return
-        const interval = window.setInterval(() => {
-            refreshDocumentReadiness()
-        }, 3000)
+        const interval = window.setInterval(() => { refreshDocumentReadiness() }, 3000)
         return () => window.clearInterval(interval)
     }, [documentsReady, refreshDocumentReadiness])
 
     useEffect(() => {
         if (!activeRunId) return
-
+        const startTime = Date.now()
         const interval = window.setInterval(async () => {
+            const elapsed = Date.now() - startTime
             try {
                 const run = await fetchAgentRun(dealId, activeRunId)
                 setResult(run)
                 if (run.valuation_result) setValuation(run.valuation_result)
-
+                if ((run as Record<string, unknown>).lbo_result) {
+                    setLboResult((run as Record<string, unknown>).lbo_result as Record<string, unknown>)
+                }
                 if (run.status === 'completed') {
                     setDeploying(false)
                     setActiveRunId(null)
@@ -77,14 +188,17 @@ export default function AgentsTab({ dealId }: Props) {
                     setDeploying(false)
                     setActiveRunId(null)
                     setError(run.error_message || 'Agent run failed')
+                } else if (elapsed > 10 * 60 * 1000) {
+                    setDeploying(false)
+                    setActiveRunId(null)
+                    setError('Agent run timed out after 10 minutes. Check server logs.')
                 }
             } catch {
                 setDeploying(false)
                 setActiveRunId(null)
                 setError('Failed to refresh agent status')
             }
-        }, 2500)
-
+        }, elapsed < 30000 ? 2500 : elapsed < 120000 ? 5000 : 10000)
         return () => window.clearInterval(interval)
     }, [activeRunId, dealId])
 
@@ -93,6 +207,7 @@ export default function AgentsTab({ dealId }: Props) {
         setError('')
         setResult(null)
         setValuation(null)
+        setLboResult(null)
 
         const docsReady = await refreshDocumentReadiness()
         if (!docsReady) {
@@ -102,21 +217,24 @@ export default function AgentsTab({ dealId }: Props) {
         }
 
         try {
-            const params: Record<string, unknown> = {
-                projection_years: projectionYears,
-                terminal_growth_rate: terminalGrowth,
+            const params: Record<string, unknown> = {}
+            for (const p of selectedAgent.params) {
+                const v = getParamValue(selectedAgent.id, p.key, p.defaultValue)
+                if (v !== '' && v !== null && v !== undefined) {
+                    params[p.key] = typeof p.defaultValue === 'number' ? Number(v) : v
+                }
             }
-            if (waccOverride) params.wacc_override = parseFloat(waccOverride)
-            if (currentMarketCap) params.current_market_cap = parseFloat(currentMarketCap)
-            if (currentSharePrice) params.current_share_price = parseFloat(currentSharePrice)
 
             const res = await deployAgent(dealId, {
-                agent_type: 'modeling',
-                task_name: 'dcf_model',
+                agent_type: selectedAgent.agentType,
+                task_name: selectedAgent.taskName,
                 parameters: params,
             })
             setResult(res)
             if (res.valuation_result) setValuation(res.valuation_result)
+            if ((res as Record<string, unknown>).lbo_result) {
+                setLboResult((res as Record<string, unknown>).lbo_result as Record<string, unknown>)
+            }
 
             if (res.status === 'completed') {
                 setDeploying(false)
@@ -129,7 +247,7 @@ export default function AgentsTab({ dealId }: Props) {
         } catch (err: unknown) {
             let msg = err instanceof Error ? err.message : 'Deployment failed'
             if (axios.isAxiosError(err) && err.code === 'ECONNABORTED') {
-                msg = 'Agent run is taking longer than the browser timeout. Please wait and try again.'
+                msg = 'Agent run is taking longer than the browser timeout. Results will appear when complete.'
             }
             if (axios.isAxiosError(err)) {
                 msg = (err.response?.data as { detail?: string } | undefined)?.detail || msg
@@ -140,8 +258,49 @@ export default function AgentsTab({ dealId }: Props) {
         }
     }
 
+    const showDCFResults = result?.status === 'completed' && selectedAgent.id === 'dcf' && valuation
+    const showLBOResults = result?.status === 'completed' && selectedAgent.id === 'lbo' && lboResult
+    const showGenericSuccess = result?.status === 'completed' && !showDCFResults && !showLBOResults
+
     return (
         <div className="animate-fade-in">
+            {/* ---- Agent Picker ---- */}
+            <div style={{ marginBottom: 16 }}>
+                <div style={{ fontSize: 10, color: '#555', fontWeight: 700, letterSpacing: '0.1em', marginBottom: 8 }}>
+                    SELECT AGENT
+                </div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                    {AGENT_CONFIGS.map(agent => (
+                        <button
+                            key={agent.id}
+                            onClick={() => { setSelectedAgentId(agent.id); setResult(null); setError(''); setValuation(null); setLboResult(null) }}
+                            style={{
+                                display: 'flex', alignItems: 'center', gap: 6,
+                                padding: '7px 12px',
+                                background: selectedAgentId === agent.id ? '#fff' : '#0a0a0a',
+                                border: selectedAgentId === agent.id ? '1px solid #fff' : '1px solid #333',
+                                borderRadius: 3,
+                                color: selectedAgentId === agent.id ? '#000' : '#888',
+                                fontSize: 11, fontWeight: 700, cursor: 'pointer',
+                                letterSpacing: '0.03em',
+                                transition: 'all 0.1s',
+                            }}
+                        >
+                            <span style={{
+                                fontSize: 9, fontWeight: 800, padding: '2px 5px',
+                                background: selectedAgentId === agent.id ? '#000' : '#222',
+                                color: selectedAgentId === agent.id ? '#fff' : '#555',
+                                borderRadius: 2, letterSpacing: '0.05em',
+                            }}>
+                                {agent.badge}
+                            </span>
+                            {agent.label}
+                        </button>
+                    ))}
+                </div>
+            </div>
+
+            {/* ---- Selected Agent Header ---- */}
             <div style={{
                 padding: '14px 18px', marginBottom: 16,
                 background: '#0a0a0a', border: '1px solid #222', borderRadius: 3,
@@ -149,15 +308,16 @@ export default function AgentsTab({ dealId }: Props) {
             }}>
                 <div>
                     <div style={{ fontSize: 14, fontWeight: 700, color: '#fff', marginBottom: 2 }}>
-                        Financial Modeling Agent
+                        {selectedAgent.label}
                     </div>
                     <div style={{ fontSize: 11, color: '#555' }}>
-                        Maker-Checker Pipeline · Preparer → Auditor → Triangulator → DCF Engine
+                        {selectedAgent.description}
                     </div>
                 </div>
-                <span className="badge badge-indigo">DCF</span>
+                <span className="badge badge-indigo">{selectedAgent.badge}</span>
             </div>
 
+            {/* ---- Document Readiness Warning ---- */}
             {!documentsReady && documentStatusNote && (
                 <div style={{
                     display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
@@ -168,42 +328,38 @@ export default function AgentsTab({ dealId }: Props) {
                 </div>
             )}
 
-            <div style={{
-                marginBottom: 16, border: '1px solid #222', borderRadius: 3, overflow: 'hidden'
-            }}>
-                <div style={{ padding: '8px 18px', background: '#0a0a0a', borderBottom: '1px solid #222' }}>
-                    <span style={{ fontSize: 10, color: '#555', fontWeight: 700, letterSpacing: '0.1em' }}>PARAMETERS</span>
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 0 }}>
-                    {[
-                        { label: 'PROJECTION YEARS', value: projectionYears, type: 'number', placeholder: '5', onChange: (v: string) => setProjectionYears(parseInt(v, 10) || 5) },
-                        { label: 'TERMINAL GROWTH', value: terminalGrowth, type: 'number', placeholder: '0.025', onChange: (v: string) => setTerminalGrowth(parseFloat(v) || 0.025) },
-                        { label: 'WACC OVERRIDE', value: waccOverride, type: 'text', placeholder: '—', onChange: (v: string) => setWaccOverride(v) },
-                        { label: 'CURRENT MARKET CAP', value: currentMarketCap, type: 'text', placeholder: 'Optional', onChange: (v: string) => setCurrentMarketCap(v) },
-                        { label: 'CURRENT SHARE PRICE', value: currentSharePrice, type: 'text', placeholder: 'Optional', onChange: (v: string) => setCurrentSharePrice(v) },
-                    ].map((param, i) => (
-                        <div key={i} style={{
-                            padding: '12px 18px',
-                            borderRight: '1px solid #1a1a1a',
-                            borderBottom: i < 3 ? '1px solid #1a1a1a' : 'none'
-                        }}>
-                            <div style={{ fontSize: 9, color: '#555', fontWeight: 700, letterSpacing: '0.1em', marginBottom: 6 }}>
-                                {param.label}
+            {/* ---- Parameters ---- */}
+            {selectedAgent.params.length > 0 && (
+                <div style={{ marginBottom: 16, border: '1px solid #222', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{ padding: '8px 18px', background: '#0a0a0a', borderBottom: '1px solid #222' }}>
+                        <span style={{ fontSize: 10, color: '#555', fontWeight: 700, letterSpacing: '0.1em' }}>PARAMETERS</span>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 0 }}>
+                        {selectedAgent.params.map((param, i) => (
+                            <div key={param.key} style={{
+                                padding: '12px 18px',
+                                borderRight: '1px solid #1a1a1a',
+                                borderBottom: i < selectedAgent.params.length - 2 ? '1px solid #1a1a1a' : 'none'
+                            }}>
+                                <div style={{ fontSize: 9, color: '#555', fontWeight: 700, letterSpacing: '0.1em', marginBottom: 6 }}>
+                                    {param.label}
+                                </div>
+                                <input
+                                    type={param.type}
+                                    className="input-field"
+                                    value={String(getParamValue(selectedAgent.id, param.key, param.defaultValue))}
+                                    placeholder={param.placeholder}
+                                    onChange={e => setParamValue(selectedAgent.id, param.key, e.target.value)}
+                                    step={param.type === 'number' ? 0.01 : undefined}
+                                    style={{ padding: '8px 10px' }}
+                                />
                             </div>
-                            <input
-                                type={param.type}
-                                className="input-field"
-                                value={param.value}
-                                placeholder={param.placeholder}
-                                onChange={e => param.onChange(e.target.value)}
-                                step={param.type === 'number' ? 0.005 : undefined}
-                                style={{ padding: '8px 10px' }}
-                            />
-                        </div>
-                    ))}
+                        ))}
+                    </div>
                 </div>
-            </div>
+            )}
 
+            {/* ---- Deploy Button ---- */}
             <button
                 className="btn-primary"
                 onClick={handleDeploy}
@@ -216,12 +372,13 @@ export default function AgentsTab({ dealId }: Props) {
                 }}
             >
                 {deploying ? (
-                    <><div className="spinner" style={{ width: 14, height: 14, borderTopColor: '#000' }} /> PROCESSING...</>
+                    <><div className="spinner" style={{ width: 14, height: 14, borderTopColor: '#000' }} /> RUNNING {selectedAgent.label.toUpperCase()}...</>
                 ) : (
-                    <><Play size={14} /> DEPLOY AGENT</>
+                    <><Play size={14} /> DEPLOY {selectedAgent.label.toUpperCase()}</>
                 )}
             </button>
 
+            {/* ---- Error ---- */}
             {error && (
                 <div style={{
                     display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
@@ -232,6 +389,7 @@ export default function AgentsTab({ dealId }: Props) {
                 </div>
             )}
 
+            {/* ---- Run Status ---- */}
             {result && (
                 <div style={{
                     display: 'flex', alignItems: 'center', gap: 8,
@@ -258,11 +416,31 @@ export default function AgentsTab({ dealId }: Props) {
                 </div>
             )}
 
+            {/* ---- Generic success (non-DCF/LBO agents) ---- */}
+            {showGenericSuccess && (
+                <div style={{
+                    padding: '16px 18px', background: 'rgba(0,204,102,0.06)',
+                    border: '1px solid rgba(0,204,102,0.15)', borderRadius: 3, marginBottom: 16,
+                }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: '#00cc66', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span className="status-dot active" />
+                        {selectedAgent.label} Complete
+                    </div>
+                    <div style={{ fontSize: 11, color: '#555', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        Output files are ready for download in the <strong style={{ color: '#888' }}>Outputs</strong> tab.
+                        <ChevronRight size={12} style={{ color: '#444' }} />
+                    </div>
+                </div>
+            )}
+
+            {/* ---- DCF Results ---- */}
             {valuation?.extraction_quality && (
                 <ExtractionAuditPanel data={valuation.extraction_quality} />
             )}
+            {showDCFResults && <DCFResultsView data={valuation!} />}
 
-            {valuation && <DCFResultsView data={valuation} />}
+            {/* ---- LBO Results ---- */}
+            {showLBOResults && <LBOResultsView data={lboResult!} />}
         </div>
     )
 }

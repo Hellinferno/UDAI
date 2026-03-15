@@ -1262,7 +1262,14 @@ class FinancialModelingAgent(BaseAgent):
                     if raw_value != llm_data[pct_field]:
                         self.observe(f"Auto-normalized {pct_field}: {raw_value} -> {llm_data[pct_field]}")
 
-            for debt_field in ("total_borrowings", "cash_and_equivalents", "lease_liabilities", "ccps_liability"):
+            for debt_field in (
+                "total_borrowings",
+                "cash_and_equivalents",
+                "lease_liabilities",
+                "lease_liabilities_current",
+                "lease_liabilities_noncurrent",
+                "ccps_liability",
+            ):
                 if llm_data.get(debt_field) is not None:
                     raw_val = llm_data[debt_field]
                     llm_data[debt_field] = self._normalize_balance_sheet_value(raw_val, normalized_revenues)
@@ -1777,6 +1784,45 @@ class FinancialModelingAgent(BaseAgent):
                 revenue_cagr_override = params["revenue_cagr_override_auto"]
                 data_sources.append(f"revenue_cagr_override: auto-capped to {revenue_cagr_override * 100:.1f}%")
 
+            # ── Run-rate anchor (Phase 2 → Phase 3 integration) ────────────────────────
+            # If partial-year quarterly data was detected and its implied annual growth
+            # diverges from the historical CAGR by more than 3 percentage points,
+            # anchor Year 1 growth to the run-rate (takes priority over historical CAGR
+            # but yields to any explicit user or LLM-extracted override above).
+            if revenue_cagr_override is None and not params.get("revenue_cagr_override"):
+                _rr = llm_data.get("partial_year_run_rate")
+                # Handle {value: ...} wrapper from LLM preparer vs direct dict from
+                # structured spreadsheet extraction.
+                if isinstance(_rr, dict) and isinstance(_rr.get("value"), dict):
+                    _rr = _rr["value"]
+                if isinstance(_rr, dict):
+                    _rr_growth = self._to_number(_rr.get("run_rate_growth_vs_last_fy"))
+                    if _rr_growth is not None and -0.50 < _rr_growth < 1.0:
+                        # Compute historical CAGR for comparison
+                        if len(historical_revenues) >= 2 and historical_revenues[0] > 0:
+                            _hist_cagr = (
+                                (historical_revenues[-1] / historical_revenues[0])
+                                ** (1.0 / (len(historical_revenues) - 1))
+                            ) - 1
+                            _hist_cagr = max(-0.30, min(0.30, _hist_cagr))
+                        else:
+                            _hist_cagr = 0.08
+                        if abs(_rr_growth - _hist_cagr) > 0.03:
+                            revenue_cagr_override = max(-0.30, min(0.50, _rr_growth))
+                            data_sources.append(
+                                f"revenue_cagr_override: run-rate anchor "
+                                f"{_rr_growth * 100:.1f}% "
+                                f"(historical CAGR={_hist_cagr * 100:.1f}%, "
+                                f"Δ={abs(_rr_growth - _hist_cagr) * 100:.1f}pp > 3pp threshold)"
+                            )
+                            self.observe(
+                                f"Run-rate anchor applied: Year 1 CAGR set to "
+                                f"{_rr_growth * 100:.1f}% from partial-year data "
+                                f"(implied run-rate="
+                                f"{_rr.get('implied_annual_run_rate', 0):,.0f} INR, "
+                                f"historical CAGR was {_hist_cagr * 100:.1f}%)."
+                            )
+
             nwc_method = str(
                 params.get("nwc_method")
                 or sector_routing.get("nwc_method")
@@ -1934,6 +1980,60 @@ class FinancialModelingAgent(BaseAgent):
                 "reasons": sector_routing.get("reasons", []),
             }
             self.observe("DCF computed successfully.")
+
+            # ── Post-DCF validation (Phase 3) ──────────────────────────────────────
+            dcf_validation_result = {}
+            try:
+                self.think("Running post-DCF self-check validation.")
+                run_rate_data_for_validator = None
+                rr = llm_data.get("partial_year_run_rate")
+                if isinstance(rr, dict) and rr.get("implied_annual_run_rate"):
+                    run_rate_data_for_validator = rr
+                elif (
+                    isinstance(rr, dict)
+                    and isinstance(rr.get("value"), dict)
+                    and rr["value"].get("implied_annual_run_rate")
+                ):
+                    run_rate_data_for_validator = rr["value"]
+
+                dcf_summary_for_validator = {
+                    "implied_enterprise_value": valuation_data.get("implied_enterprise_value"),
+                    "implied_equity_value": valuation_data.get("implied_equity_value"),
+                    "net_debt": valuation_data.get("net_debt"),
+                    "projections": {
+                        "revenue": projections_data["projections"]["revenue"],
+                        "ebitda_margin_pct": projections_data["projections"]["ebitda_margin_pct"],
+                    },
+                }
+                validator_prompt = PromptBuilder.build_dcf_validator_prompt(
+                    dcf_output=dcf_summary_for_validator,
+                    extracted_data=llm_data,
+                    wacc=wacc,
+                    run_rate_data=run_rate_data_for_validator,
+                )
+                validator_system = "You are a DCF quality checker. Return only valid JSON."
+                raw_validator_response = ask_llm(validator_system, validator_prompt)
+                raw_validator_response = raw_validator_response.strip()
+                import re as _re
+                raw_validator_response = _re.sub(r"<think>.*?</think>", "", raw_validator_response, flags=_re.DOTALL).strip()
+                raw_validator_response = raw_validator_response.replace("```json", "").replace("```", "").strip()
+                try:
+                    dcf_validation_result = json.loads(raw_validator_response)
+                except json.JSONDecodeError:
+                    fb = raw_validator_response.find("{")
+                    lb = raw_validator_response.rfind("}")
+                    if fb != -1 and lb > fb:
+                        dcf_validation_result = json.loads(raw_validator_response[fb:lb + 1])
+
+                val_overall = dcf_validation_result.get("overall", "unknown")
+                corrections_needed = dcf_validation_result.get("corrections_needed", [])
+                self.observe(
+                    f"Post-DCF validation: {val_overall}. "
+                    + (f"Corrections needed: {corrections_needed}" if corrections_needed else "All checks passed.")
+                )
+            except Exception as _val_exc:
+                self.observe(f"Post-DCF validation skipped ({_val_exc}).")
+                dcf_validation_result = {"overall": "skipped", "error": str(_val_exc)}
 
             private_adjustment_factor = 1.0
             liquidity_discount = 0.0
@@ -2306,6 +2406,12 @@ class FinancialModelingAgent(BaseAgent):
                     f"MONTE CARLO RISK SIGNAL: probability of loss is {mc_loss_prob * 100:.1f}%. "
                     "Stress-case downside appears material."
                 )
+            if dcf_validation_result.get("overall") == "FAIL":
+                failed_checks = dcf_validation_result.get("corrections_needed", [])
+                warnings.append(
+                    "DCF SELF-CHECK FAILED: "
+                    + ("; ".join(failed_checks[:3]) if failed_checks else "model output did not pass all validation checks.")
+                )
 
             valuation_result = {
                 "header": {
@@ -2348,6 +2454,7 @@ class FinancialModelingAgent(BaseAgent):
                     "metric": sensitivity.get("metric", valuation_basis),
                 },
                 "market_sanity": market_sanity,
+                "dcf_validation": dcf_validation_result,
                 "extraction_quality": extraction_quality,
                 "company_classification": company_context,
                 "assumptions": projections_data["assumptions"],

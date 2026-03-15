@@ -30,6 +30,9 @@ _OCR_MIN_PAGE_CHARS = int(os.environ.get("AIBAA_OCR_MIN_PAGE_CHARS", "40"))
 
 _NUMERIC_LINE_RE = re.compile(r"(?:\d[\d,\.\-]*%?)")
 _FY_LABEL_RE = re.compile(r"^FY(\d{2})$", re.I)
+# Quarterly column patterns: "1Q26", "2Q26" or "Q1FY26", "Q2FY26"
+_QUARTERLY_LABEL_RE = re.compile(r"^([1-4])Q(\d{2})$", re.I)
+_QUARTERLY_LABEL_RE_ALT = re.compile(r"^Q([1-4])[\s\-]?FY(\d{2})$", re.I)
 _SECTION_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
     "Revenue": (
         re.compile(r"\brevenue\b", re.I),
@@ -84,6 +87,13 @@ _SPREADSHEET_DEBT_LABELS = (
     "long term debt borrowings",
     "long term borrowings",
     "borrowings",
+)
+_SPREADSHEET_LEASE_LABELS = (
+    "lease liabilities",
+    "finance lease liabilities",
+    "right of use liabilities",
+    "rou liabilities",
+    "operating lease liabilities",
 )
 _SPREADSHEET_PAT_LABELS = (
     "net profit after taxes",
@@ -168,6 +178,29 @@ def _find_fy_columns(ws) -> list[tuple[int, int]]:
     return sorted(best_matches, key=lambda item: item[1])[-5:]
 
 
+def _find_quarterly_columns(ws) -> list[tuple[int, int, int]]:
+    """Find quarterly period columns; returns list of (col_idx, quarter_num, fiscal_year).
+
+    Supports formats: "1Q26", "2Q26" and "Q1FY26", "Q2FY26".
+    Returns at most 8 entries sorted by (fiscal_year, quarter_num).
+    """
+    best_matches: list[tuple[int, int, int]] = []
+    for row in ws.iter_rows(min_row=1, max_row=8, values_only=True):
+        current: list[tuple[int, int, int]] = []
+        for idx, value in enumerate(row, start=1):
+            cell = str(value or "").strip()
+            m1 = _QUARTERLY_LABEL_RE.fullmatch(cell)
+            if m1:
+                current.append((idx, int(m1.group(1)), 2000 + int(m1.group(2))))
+                continue
+            m2 = _QUARTERLY_LABEL_RE_ALT.fullmatch(cell)
+            if m2:
+                current.append((idx, int(m2.group(1)), 2000 + int(m2.group(2))))
+        if len(current) > len(best_matches):
+            best_matches = current
+    return sorted(best_matches, key=lambda x: (x[2], x[1]))[-8:]
+
+
 def _sum_series(rows: list[tuple[int, tuple[Any, ...]]], fy_cols: list[tuple[int, int]], multiplier: float) -> list[float]:
     totals = [0.0 for _ in fy_cols]
     for _, row in rows:
@@ -244,6 +277,7 @@ def extract_structured_financials(storage_path: str, file_type: str) -> Optional
         depreciation_rows = [entry for entry in row_entries if _match_any_label(entry[1], _SPREADSHEET_DEPRECIATION_LABELS)]
         cash_rows = [entry for entry in row_entries if _match_any_label(entry[1], _SPREADSHEET_CASH_LABELS)]
         debt_rows = [entry for entry in row_entries if _match_any_label(entry[1], _SPREADSHEET_DEBT_LABELS)]
+        lease_rows = [entry for entry in row_entries if _match_any_label(entry[1], _SPREADSHEET_LEASE_LABELS)]
         pat_row = _pick_row(row_entries, _SPREADSHEET_PAT_LABELS)
         eps_row = _pick_row(row_entries, _SPREADSHEET_EPS_LABELS)
         shares_row = _pick_row(row_entries, _SPREADSHEET_SHARES_LABELS)
@@ -277,6 +311,54 @@ def extract_structured_financials(storage_path: str, file_type: str) -> Optional
         cash_and_equivalents = sum(_sum_series([(row_idx, row) for row_idx, _, row in cash_rows], fy_cols, multiplier))
         cash_latest = _sum_series([(row_idx, row) for row_idx, _, row in cash_rows], fy_cols, multiplier)[-1]
         total_borrowings = _sum_series([(row_idx, row) for row_idx, _, row in debt_rows], fy_cols, multiplier)[-1]
+
+        # Lease liabilities: current (first match) + non-current (second match)
+        lease_series = _sum_series([(row_idx, row) for row_idx, _, row in lease_rows], fy_cols, multiplier)
+        lease_total_latest = lease_series[-1] if lease_series else 0.0
+        lease_current_latest: Optional[float] = None
+        lease_noncurrent_latest: Optional[float] = None
+        if len(lease_rows) >= 2:
+            curr_s = _series_from_row(lease_rows[0][2], fy_cols, multiplier)
+            ncurr_s = _series_from_row(lease_rows[1][2], fy_cols, multiplier)
+            lease_current_latest = curr_s[-1] if curr_s else None
+            lease_noncurrent_latest = ncurr_s[-1] if ncurr_s else None
+        elif len(lease_rows) == 1:
+            lease_current_latest = lease_total_latest
+
+        # Quarterly run-rate: detect partial-year quarters and compute implied annual revenue
+        quarterly_cols = _find_quarterly_columns(ws)
+        run_rate_data: Optional[dict[str, Any]] = None
+        if quarterly_cols and revenue_row is not None:
+            from collections import defaultdict as _dd
+            quarters_by_fy: dict[int, list[tuple[int, int]]] = _dd(list)
+            for col_idx, q_num, q_fy in quarterly_cols:
+                quarters_by_fy[q_fy].append((col_idx, q_num))
+            latest_q_fy = max(quarters_by_fy.keys())
+            latest_fy_quarters = sorted(quarters_by_fy[latest_q_fy], key=lambda x: x[1])
+            n_quarters = len(latest_fy_quarters)
+            if 0 < n_quarters < 4:
+                ytd_rev = 0.0
+                for col_idx, _ in latest_fy_quarters:
+                    raw = revenue_row[2][col_idx - 1] if col_idx - 1 < len(revenue_row[2]) else None
+                    v = _to_number(raw)
+                    if v is not None:
+                        ytd_rev += v * multiplier
+                if ytd_rev > 0:
+                    implied_run_rate = (ytd_rev / n_quarters) * 4
+                    last_fy_rev = revenues[-1] if revenues else None
+                    run_rate_growth = (
+                        (implied_run_rate - last_fy_rev) / last_fy_rev
+                        if last_fy_rev and last_fy_rev > 0
+                        else None
+                    )
+                    run_rate_data = {
+                        "partial_quarters_reported": n_quarters,
+                        "fiscal_year_partial": latest_q_fy,
+                        "ytd_revenue_inr": round(ytd_rev, 2),
+                        "implied_annual_run_rate": round(implied_run_rate, 2),
+                        "run_rate_growth_vs_last_fy": round(run_rate_growth, 4) if run_rate_growth is not None else None,
+                    }
+
         profit_after_tax = (
             _series_from_row(pat_row[2], fy_cols, multiplier)[-1]
             if pat_row is not None
@@ -302,11 +384,15 @@ def extract_structured_financials(storage_path: str, file_type: str) -> Optional
         da_percent_rev = (latest_dep / latest_revenue) if latest_revenue else None
         net_debt = total_borrowings - cash_latest
 
+        net_debt = total_borrowings + lease_total_latest - cash_latest
         extracted_data = {
             "historical_revenues": [int(value) for value in revenues if value is not None],
             "historical_ebitda_margins": [round(float(value), 4) for value in ebitda_margins if value is not None],
             "net_debt": round(float(net_debt), 2),
             "total_borrowings": round(float(total_borrowings), 2),
+            "lease_liabilities": round(float(lease_total_latest), 2),
+            "lease_liabilities_current": round(float(lease_current_latest), 2) if lease_current_latest is not None else None,
+            "lease_liabilities_noncurrent": round(float(lease_noncurrent_latest), 2) if lease_noncurrent_latest is not None else None,
             "cash_and_equivalents": round(float(cash_latest), 2),
             "shares_outstanding": round(float(shares_outstanding), 0) if shares_outstanding else None,
             "diluted_shares_outstanding": round(float(shares_outstanding), 0) if shares_outstanding else None,
@@ -321,6 +407,7 @@ def extract_structured_financials(storage_path: str, file_type: str) -> Optional
             "basic_eps": round(float(basic_eps), 2) if basic_eps is not None else None,
             "currency": "INR",
             "listing_status": "listed" if shares_outstanding and basic_eps else "unknown",
+            "partial_year_run_rate": run_rate_data,
         }
 
         audit_trail = [
@@ -354,6 +441,19 @@ def extract_structured_financials(storage_path: str, file_type: str) -> Optional
                 "confidence": 0.85,
                 "source_citation": f"{source_suffix} | borrowing rows {[row_idx for row_idx, _, _ in debt_rows]}",
                 "reasoning": "Summed borrowing rows for the latest fiscal year.",
+            },
+            {
+                "field": "lease_liabilities",
+                "value": extracted_data["lease_liabilities"],
+                "confidence": 0.85 if lease_rows else 0.5,
+                "source_citation": (
+                    f"{source_suffix} | lease rows {[row_idx for row_idx, _, _ in lease_rows]}"
+                    if lease_rows else f"{source_suffix} | no lease rows found — confirmed zero"
+                ),
+                "reasoning": (
+                    "Summed current + non-current lease liability rows (IFRS 16 / Ind AS 116)."
+                    if lease_rows else "No lease liability rows detected; value assumed zero."
+                ),
             },
         ]
 
@@ -417,11 +517,43 @@ def extract_structured_financials(storage_path: str, file_type: str) -> Optional
                 }
             )
 
+        if run_rate_data:
+            audit_trail.append(
+                {
+                    "field": "partial_year_run_rate",
+                    "value": run_rate_data,
+                    "confidence": 0.90,
+                    "source_citation": (
+                        f"{source_suffix} | quarterly cols for FY{str(run_rate_data['fiscal_year_partial'])[-2:]}"
+                    ),
+                    "reasoning": (
+                        f"Detected {run_rate_data['partial_quarters_reported']} partial quarters; "
+                        f"YTD={run_rate_data['ytd_revenue_inr']:,.0f}, "
+                        f"implied run-rate={run_rate_data['implied_annual_run_rate']:,.0f}, "
+                        f"run-rate growth vs last FY="
+                        + (f"{run_rate_data['run_rate_growth_vs_last_fy']*100:.1f}%" if run_rate_data.get('run_rate_growth_vs_last_fy') is not None else "n/a")
+                        + "."
+                    ),
+                }
+            )
+
+        reconciliation_note = "Structured spreadsheet extraction from FY columns in the INR financial sheet."
+        if run_rate_data:
+            reconciliation_note += (
+                f" Partial-year run-rate detected: {run_rate_data['partial_quarters_reported']}Q of "
+                f"FY{str(run_rate_data['fiscal_year_partial'])[-2:]} reported; "
+                f"implied annual run-rate = {run_rate_data['implied_annual_run_rate']:,.0f} INR."
+            )
+        if lease_total_latest > 0:
+            reconciliation_note += (
+                f" Lease liabilities (IFRS 16) = {lease_total_latest:,.0f} INR included in net debt."
+            )
+
         wb.close()
         return {
             "extracted_data": extracted_data,
             "audit_trail": audit_trail,
-            "reconciliation_log": "Structured spreadsheet extraction from FY columns in the INR financial sheet.",
+            "reconciliation_log": reconciliation_note,
             "extraction_mode": "structured_spreadsheet",
         }
     except Exception as exc:

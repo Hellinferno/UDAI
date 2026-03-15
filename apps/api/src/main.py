@@ -22,7 +22,7 @@ import db_models  # noqa: F401 - ensure ORM models are registered
 from database import Base, SessionLocal, engine
 from db_models import DealModel, DocumentModel
 from persistence import hydrate_store_from_db, sync_deal_to_store, sync_document_to_store
-from routers import agents, auth, deals, documents, outputs
+from routers import agents, auth, deals, documents, outputs, tasks
 
 # Ensure database tables are created synchronously on startup
 Base.metadata.create_all(bind=engine)
@@ -86,6 +86,7 @@ app.include_router(agents.router, prefix="/api/v1")
 app.include_router(outputs.deal_router, prefix="/api/v1")
 app.include_router(outputs.output_router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
+app.include_router(tasks.router, prefix="/api/v1")
 
 
 @app.get("/api/v1/health", tags=["Health"])
@@ -168,7 +169,7 @@ async def _recover_uploads() -> None:
                 company_name="(Restored from disk)",
             )
             db.add(db_deal)
-            db.flush()
+            db.commit()
         sync_deal_to_store(db_deal)
 
         for fpath in deal_dir.iterdir():
@@ -196,7 +197,7 @@ async def _recover_uploads() -> None:
                     parse_status="pending",
                 )
                 db.add(db_doc)
-                db.flush()
+                db.commit()
             sync_document_to_store(db_doc)
             to_parse.append(file_id)
 

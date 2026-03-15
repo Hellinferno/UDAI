@@ -121,6 +121,7 @@ export interface AgentRunResult {
     status: string;
     steps: Array<Record<string, unknown>>;
     valuation_result?: ValuationResult;
+    lbo_result?: Record<string, unknown> | null;
     error_message?: string | null;
     confidence_score?: number | null;
     route?: Record<string, unknown>;
@@ -375,4 +376,53 @@ export async function downloadOutput(outputId: string, filename: string): Promis
     link.click();
     link.remove();
     window.URL.revokeObjectURL(blobUrl);
+}
+
+// ---- Tasks ----
+
+export interface Task {
+    task_id: string;
+    deal_id: string;
+    title: string;
+    status: 'todo' | 'in_progress' | 'done' | 'blocked';
+    priority: 'low' | 'medium' | 'high';
+    owner: string;
+    is_ai_generated: boolean;
+    created_at: string | null;
+}
+
+export interface TaskCreatePayload {
+    title: string;
+    priority?: 'low' | 'medium' | 'high';
+    owner?: string;
+}
+
+export interface TaskUpdatePayload {
+    title?: string;
+    status?: 'todo' | 'in_progress' | 'done' | 'blocked';
+    priority?: 'low' | 'medium' | 'high';
+    owner?: string;
+}
+
+export async function fetchTasks(dealId: string): Promise<Task[]> {
+    await ensureAuthToken();
+    const res = await api.get<APIResponse<{ tasks: Task[]; total: number }>>(`/deals/${dealId}/tasks`);
+    return res.data.data.tasks;
+}
+
+export async function createTask(dealId: string, payload: TaskCreatePayload): Promise<Task> {
+    await ensureAuthToken();
+    const res = await api.post<APIResponse<Task>>(`/deals/${dealId}/tasks`, payload);
+    return res.data.data;
+}
+
+export async function updateTask(dealId: string, taskId: string, update: TaskUpdatePayload): Promise<Task> {
+    await ensureAuthToken();
+    const res = await api.patch<APIResponse<Task>>(`/deals/${dealId}/tasks/${taskId}`, update);
+    return res.data.data;
+}
+
+export async function deleteTask(dealId: string, taskId: string): Promise<void> {
+    await ensureAuthToken();
+    await api.delete(`/deals/${dealId}/tasks/${taskId}`);
 }

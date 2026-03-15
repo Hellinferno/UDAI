@@ -393,6 +393,384 @@ class WorkbookBuilder:
         if not os.path.abspath(filepath).startswith(self.output_dir):
             raise ValueError(f"Output path escapes output_dir: {filepath}")
         logger.info("[ExcelWriter] Saving DCF workbook to %s", filepath)
-        
+
+        wb.save(filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # DD Checklist Workbook
+    # ------------------------------------------------------------------
+
+    def write_dd_checklist(self, deal_name: str, risk_data: dict) -> str:
+        """
+        Generate an IB-quality Due Diligence checklist Excel workbook.
+
+        Tabs:
+          1. Summary — overall risk score + red flags
+          2. Risk Checklist — all risks by category, severity colour-coded
+        """
+        wb = openpyxl.Workbook()
+
+        # ---- Colours ----
+        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        amber_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+        green_fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
+        grey_fill = PatternFill(start_color="D9D9D9", end_color="D9D9D9", fill_type="solid")
+        white_font = Font(name="Arial", bold=True, color="FFFFFF")
+        bold_font = Font(name="Arial", bold=True)
+        normal_font = Font(name="Arial")
+        wrap_align = Alignment(wrap_text=True, vertical="top")
+
+        severity_fill = {
+            "high": red_fill,
+            "medium": amber_fill,
+            "low": green_fill,
+        }
+        severity_font = {
+            "high": white_font,
+            "medium": Font(name="Arial", bold=True, color="FFFFFF"),
+            "low": white_font,
+        }
+
+        # ---- TAB 1: Summary ----
+        ws_summary = wb.active
+        ws_summary.title = "Summary"
+
+        # Header
+        ws_summary["A1"] = f"DUE DILIGENCE REPORT — {deal_name.upper()}"
+        ws_summary["A1"].font = Font(name="Arial", bold=True, size=14)
+        ws_summary["A1"].fill = self.header_fill
+        ws_summary["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+        ws_summary.merge_cells("A1:D1")
+
+        ws_summary["A3"] = "Overall Risk Score"
+        ws_summary["A3"].font = bold_font
+        ws_summary["B3"] = risk_data.get("overall_risk_score", 0)
+        ws_summary["C3"] = "/ 10"
+        rating = risk_data.get("risk_rating", "MEDIUM")
+        ws_summary["D3"] = rating
+        rating_fill = {"LOW": green_fill, "MEDIUM": amber_fill, "HIGH": red_fill, "CRITICAL": red_fill}.get(rating, amber_fill)
+        ws_summary["D3"].fill = rating_fill
+        ws_summary["D3"].font = white_font
+
+        ws_summary["A5"] = "Executive Summary"
+        ws_summary["A5"].font = bold_font
+        ws_summary["A6"] = risk_data.get("summary", "")
+        ws_summary["A6"].alignment = wrap_align
+        ws_summary.merge_cells("A6:D6")
+        ws_summary.row_dimensions[6].height = 60
+
+        ws_summary["A8"] = "RED FLAGS"
+        ws_summary["A8"].font = Font(name="Arial", bold=True, color="FFFFFF")
+        ws_summary["A8"].fill = red_fill
+        ws_summary.merge_cells("A8:D8")
+
+        headers = ["Flag", "Impact", "Recommendation"]
+        for col_idx, h in enumerate(headers, start=1):
+            cell = ws_summary.cell(row=9, column=col_idx, value=h)
+            cell.font = self.header_font
+            cell.fill = self.header_fill
+
+        for row_idx, flag_item in enumerate(risk_data.get("red_flags", []), start=10):
+            ws_summary.cell(row=row_idx, column=1, value=flag_item.get("flag", "")).font = normal_font
+            ws_summary.cell(row=row_idx, column=2, value=flag_item.get("impact", "")).font = normal_font
+            ws_summary.cell(row=row_idx, column=3, value=flag_item.get("recommendation", "")).font = normal_font
+
+        for col in ["A", "B", "C", "D"]:
+            ws_summary.column_dimensions[col].width = 35
+
+        # ---- TAB 2: Risk Checklist ----
+        ws_risks = wb.create_sheet("Risk Checklist")
+
+        risk_headers = ["Category", "Risk Description", "Severity", "Evidence", "Mitigation", "Status", "Assigned To"]
+        for col_idx, h in enumerate(risk_headers, start=1):
+            cell = ws_risks.cell(row=1, column=col_idx, value=h)
+            cell.font = self.header_font
+            cell.fill = self.header_fill
+
+        row = 2
+        categories = [
+            ("Financial", risk_data.get("financial_risks", [])),
+            ("Operational", risk_data.get("operational_risks", [])),
+            ("Legal", risk_data.get("legal_risks", [])),
+            ("Market", risk_data.get("market_risks", [])),
+        ]
+        for cat_name, risks in categories:
+            for risk_item in risks:
+                severity = str(risk_item.get("severity", "medium")).lower()
+                ws_risks.cell(row=row, column=1, value=cat_name).font = normal_font
+                ws_risks.cell(row=row, column=2, value=risk_item.get("risk", "")).alignment = wrap_align
+                sev_cell = ws_risks.cell(row=row, column=3, value=severity.upper())
+                sev_cell.fill = severity_fill.get(severity, grey_fill)
+                sev_cell.font = severity_font.get(severity, bold_font)
+                ws_risks.cell(row=row, column=4, value=risk_item.get("evidence", "")).alignment = wrap_align
+                ws_risks.cell(row=row, column=5, value=risk_item.get("mitigation", "")).alignment = wrap_align
+                ws_risks.cell(row=row, column=6, value="Open")
+                ws_risks.cell(row=row, column=7, value="")
+                row += 1
+
+        col_widths = [15, 40, 10, 35, 35, 12, 20]
+        for col_idx, width in enumerate(col_widths, start=1):
+            ws_risks.column_dimensions[get_column_letter(col_idx)].width = width
+
+        # Save
+        safe_name = _UNSAFE_CHARS.sub("_", deal_name.strip().lower().replace(" ", "_"))[:60]
+        filename = f"dd_checklist_{safe_name}.xlsx"
+        filepath = os.path.join(self.output_dir, filename)
+        if not os.path.abspath(filepath).startswith(self.output_dir):
+            raise ValueError(f"Output path escapes output_dir: {filepath}")
+        logger.info("[ExcelWriter] Saving DD checklist to %s", filepath)
+        wb.save(filepath)
+        return filepath
+
+    # ------------------------------------------------------------------
+    # LBO Model Workbook
+    # ------------------------------------------------------------------
+
+    def write_lbo_model(self, deal_name: str, lbo_result: dict) -> str:
+        """
+        Generate an IB-quality LBO model Excel workbook.
+
+        Tabs:
+          1. Sources & Uses
+          2. Operating Model
+          3. Debt Schedule
+          4. Returns Analysis
+          5. IRR Sensitivity
+        """
+        wb = openpyxl.Workbook()
+
+        # ---- Shared fills ----
+        green_fill = PatternFill(start_color="00B050", end_color="00B050", fill_type="solid")
+        amber_fill = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+        blue_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
+        light_blue_fill = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+        white_font = Font(name="Arial", bold=True, color="FFFFFF")
+        bold_font = Font(name="Arial", bold=True)
+        normal_font = Font(name="Arial")
+        pct_fmt = "0.0%"
+        num_fmt = '#,##0'
+        curr_fmt = '#,##0.00'
+
+        def hdr(ws, row, col, value, fill=None):
+            c = ws.cell(row=row, column=col, value=value)
+            c.font = self.header_font
+            c.fill = fill or self.header_fill
+            return c
+
+        def val(ws, row, col, value, fmt=None):
+            c = ws.cell(row=row, column=col, value=value)
+            c.font = self.calc_font
+            if fmt:
+                c.number_format = fmt
+            return c
+
+        # ---- TAB 1: Sources & Uses ----
+        ws_su = wb.active
+        ws_su.title = "Sources & Uses"
+        su = lbo_result.get("sources_uses", {})
+
+        ws_su["A1"] = f"LBO MODEL — {deal_name.upper()} — SOURCES & USES"
+        ws_su["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+        ws_su["A1"].fill = self.header_fill
+        ws_su.merge_cells("A1:C1")
+
+        su_rows = [
+            ("SOURCES", ""),
+            ("Equity", su.get("equity", 0)),
+            ("Senior Debt (TLA + TLB)", su.get("senior_debt", 0)),
+            ("Mezzanine Debt", su.get("mezz_debt", 0)),
+            ("Total Sources", su.get("total_sources", 0)),
+            ("", ""),
+            ("USES", ""),
+            ("Purchase Price (Entry EV)", su.get("entry_ev", 0)),
+            ("Total Uses", su.get("total_uses", 0)),
+            ("", ""),
+            ("Leverage Statistics", ""),
+            ("Equity %", f"{su.get('equity_pct', 0):.1f}%"),
+            ("Debt %", f"{su.get('debt_pct', 0):.1f}%"),
+            ("Total Leverage (x EBITDA)", su.get("leverage_multiple", 0)),
+        ]
+        for r_idx, (label, value) in enumerate(su_rows, start=3):
+            label_cell = ws_su.cell(row=r_idx, column=1, value=label)
+            val_cell = ws_su.cell(row=r_idx, column=2, value=value)
+            if label in ("SOURCES", "USES", "Leverage Statistics"):
+                label_cell.font = bold_font
+                label_cell.fill = light_blue_fill
+            elif label in ("Total Sources", "Total Uses"):
+                label_cell.font = bold_font
+                val_cell.font = Font(name="Arial", bold=True, color="0000FF")
+                val_cell.number_format = curr_fmt
+            elif isinstance(value, (int, float)):
+                val_cell.font = self.calc_font
+                val_cell.number_format = curr_fmt
+
+        ws_su.column_dimensions["A"].width = 30
+        ws_su.column_dimensions["B"].width = 20
+
+        # ---- TAB 2: Operating Model ----
+        ws_ops = wb.create_sheet("Operating Model")
+        op = lbo_result.get("operating_model", {})
+        years = list(range(1, len(op.get("revenues", [])) + 1))
+
+        ws_ops["A1"] = f"LBO MODEL — {deal_name.upper()} — OPERATING MODEL"
+        ws_ops["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+        ws_ops["A1"].fill = self.header_fill
+        ws_ops.merge_cells(f"A1:{get_column_letter(len(years) + 1)}1")
+
+        hdr(ws_ops, 2, 1, "Metric")
+        for j, yr in enumerate(years, start=2):
+            hdr(ws_ops, 2, j, f"Year {yr}")
+
+        op_rows = [
+            ("Revenue", op.get("revenues", []), curr_fmt),
+            ("EBITDA", op.get("ebitda", []), curr_fmt),
+            ("EBIT", op.get("ebit", []), curr_fmt),
+            ("Unlevered FCF", op.get("ufcf", []), curr_fmt),
+        ]
+        for r_offset, (label, values, fmt) in enumerate(op_rows, start=3):
+            ws_ops.cell(row=r_offset, column=1, value=label).font = bold_font
+            for j, v in enumerate(values, start=2):
+                val(ws_ops, r_offset, j, v, fmt)
+
+        for col in range(1, len(years) + 2):
+            ws_ops.column_dimensions[get_column_letter(col)].width = 18
+
+        # ---- TAB 3: Debt Schedule ----
+        ws_debt = wb.create_sheet("Debt Schedule")
+        schedule = lbo_result.get("debt_schedule", [])
+
+        ws_debt["A1"] = f"LBO MODEL — {deal_name.upper()} — DEBT SCHEDULE"
+        ws_debt["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+        ws_debt["A1"].fill = self.header_fill
+        ws_debt.merge_cells(f"A1:I1")
+
+        ds_headers = ["Year", "Opening Debt", "TLA Balance", "TLB Balance", "Mezz Balance",
+                      "Cash Interest", "Mandatory Amort", "Cash Sweep", "Closing Debt"]
+        for col_idx, h in enumerate(ds_headers, start=1):
+            hdr(ws_debt, 2, col_idx, h)
+
+        dscr_by_year = lbo_result.get("dscr_by_year", {})
+        for r_offset, ds in enumerate(schedule, start=3):
+            yr = ds.get("year", r_offset - 2)
+            cells = [yr, ds.get("opening_debt"), ds.get("tla_balance"), ds.get("tlb_balance"),
+                     ds.get("mezz_balance"), ds.get("cash_interest"), ds.get("mandatory_amort"),
+                     ds.get("cash_sweep"), ds.get("closing_debt")]
+            for col_idx, v in enumerate(cells, start=1):
+                c = val(ws_debt, r_offset, col_idx, v, curr_fmt if col_idx > 1 else None)
+            # DSCR annotation
+            dscr = dscr_by_year.get(yr)
+            if dscr is not None:
+                dscr_cell = ws_debt.cell(row=r_offset, column=10, value=dscr)
+                dscr_cell.number_format = "0.00x"
+                if dscr >= 1.4:
+                    dscr_cell.fill = green_fill
+                    dscr_cell.font = Font(name="Arial", color="FFFFFF")
+                elif dscr >= 1.0:
+                    dscr_cell.fill = amber_fill
+                    dscr_cell.font = Font(name="Arial", bold=True)
+                else:
+                    dscr_cell.fill = red_fill
+                    dscr_cell.font = Font(name="Arial", bold=True, color="FFFFFF")
+
+        hdr(ws_debt, 2, 10, "DSCR")
+        for col in range(1, 11):
+            ws_debt.column_dimensions[get_column_letter(col)].width = 18
+
+        # ---- TAB 4: Returns Analysis ----
+        ws_ret = wb.create_sheet("Returns Analysis")
+
+        ws_ret["A1"] = f"LBO MODEL — {deal_name.upper()} — RETURNS ANALYSIS"
+        ws_ret["A1"].font = Font(name="Arial", bold=True, size=12, color="FFFFFF")
+        ws_ret["A1"].fill = self.header_fill
+        ws_ret.merge_cells("A1:C1")
+
+        ret_rows = [
+            ("Entry EV", lbo_result.get("entry_ev", 0), curr_fmt),
+            ("Entry Equity", lbo_result.get("entry_equity", 0), curr_fmt),
+            ("Total Debt at Entry", lbo_result.get("total_debt_at_entry", 0), curr_fmt),
+            ("", None, None),
+            ("Exit EV", lbo_result.get("exit_ev", 0), curr_fmt),
+            ("Total Debt at Exit", lbo_result.get("total_debt_at_exit", 0), curr_fmt),
+            ("Exit Equity", lbo_result.get("exit_equity", 0), curr_fmt),
+            ("", None, None),
+            ("IRR", lbo_result.get("irr", 0), pct_fmt),
+            ("MOIC", lbo_result.get("moic", 0), "0.00x"),
+        ]
+        for r_idx, (label, value, fmt) in enumerate(ret_rows, start=3):
+            ws_ret.cell(row=r_idx, column=1, value=label).font = bold_font
+            if value is not None:
+                c = ws_ret.cell(row=r_idx, column=2, value=value)
+                c.font = self.calc_font
+                if fmt:
+                    c.number_format = fmt
+            if label in ("IRR", "MOIC"):
+                ws_ret.cell(row=r_idx, column=1).fill = blue_fill
+                ws_ret.cell(row=r_idx, column=1).font = Font(name="Arial", bold=True, color="FFFFFF")
+
+        ws_ret.column_dimensions["A"].width = 28
+        ws_ret.column_dimensions["B"].width = 20
+
+        # ---- TAB 5: IRR Sensitivity ----
+        ws_sens = wb.create_sheet("Sensitivity")
+
+        entry_multiples = [
+            lbo_result["sources_uses"].get("leverage_multiple", 8.0) - 2,
+            lbo_result["sources_uses"].get("leverage_multiple", 8.0) - 1,
+            lbo_result["sources_uses"].get("leverage_multiple", 8.0),
+            lbo_result["sources_uses"].get("leverage_multiple", 8.0) + 1,
+            lbo_result["sources_uses"].get("leverage_multiple", 8.0) + 2,
+        ]
+        # Use entry EV/EBITDA for sensitivity (from sources_uses entry_ev / entry_ebitda)
+        base_entry_ev = lbo_result.get("entry_ev", 0)
+        # Approximate entry EV/EBITDA range using IRR result
+        exit_base = lbo_result.get("exit_ev", base_entry_ev)
+        base_irr = lbo_result.get("irr_pct", 20.0)
+
+        ws_sens["A1"] = "IRR SENSITIVITY (Entry EV/EBITDA × Exit EV/EBITDA)"
+        ws_sens["A1"].font = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+        ws_sens["A1"].fill = self.header_fill
+        ws_sens.merge_cells("A1:F1")
+
+        ws_sens["A2"] = "IRR %"
+        ws_sens["A2"].font = bold_font
+
+        # Populate if sensitivity data is available
+        sensitivity = lbo_result.get("irr_sensitivity", {})
+        if sensitivity:
+            exit_multiples = sorted({xm for row_dict in sensitivity.values() for xm in row_dict.keys()})
+            hdr(ws_sens, 3, 1, "Entry \\ Exit")
+            for col_idx, xm in enumerate(exit_multiples, start=2):
+                hdr(ws_sens, 3, col_idx, f"{xm}x")
+            for r_idx, (em, row_dict) in enumerate(sensitivity.items(), start=4):
+                ws_sens.cell(row=r_idx, column=1, value=f"{em}x").font = bold_font
+                for col_idx, xm in enumerate(exit_multiples, start=2):
+                    irr_val = row_dict.get(xm)
+                    c = ws_sens.cell(row=r_idx, column=col_idx, value=irr_val)
+                    if irr_val is not None:
+                        c.number_format = "0.0%"
+                        c.value = irr_val / 100  # convert to decimal for pct format
+                        if irr_val >= 20:
+                            c.fill = green_fill
+                            c.font = Font(name="Arial", color="FFFFFF")
+                        elif irr_val >= 10:
+                            c.fill = amber_fill
+                        else:
+                            c.fill = red_fill
+                            c.font = Font(name="Arial", color="FFFFFF")
+        else:
+            ws_sens["A3"] = "Sensitivity data not available — run LBO engine with irr_sensitivity() to populate."
+
+        for col in range(1, 7):
+            ws_sens.column_dimensions[get_column_letter(col)].width = 16
+
+        # Save
+        safe_name = _UNSAFE_CHARS.sub("_", deal_name.strip().lower().replace(" ", "_"))[:60]
+        filename = f"lbo_model_{safe_name}.xlsx"
+        filepath = os.path.join(self.output_dir, filename)
+        if not os.path.abspath(filepath).startswith(self.output_dir):
+            raise ValueError(f"Output path escapes output_dir: {filepath}")
+        logger.info("[ExcelWriter] Saving LBO workbook to %s", filepath)
         wb.save(filepath)
         return filepath

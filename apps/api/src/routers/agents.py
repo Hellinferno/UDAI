@@ -1,7 +1,7 @@
 import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -17,8 +17,15 @@ from persistence import (
     sync_document_to_store,
 )
 from store import store
+from agents.base import BaseAgent
 from agents.orchestrator import OrchestratorAgent
 from agents.modeling import FinancialModelingAgent
+from agents.lbo_modeling import LBOModelingAgent
+from agents.pitchbook import PitchbookAgent
+from agents.due_diligence import DueDiligenceAgent
+from agents.research import ResearchAgent
+from agents.doc_drafter import DocDrafterAgent
+from agents.coordination import CoordinationAgent
 from database import SessionLocal
 
 logger = logging.getLogger(__name__)
@@ -44,17 +51,35 @@ def _sanitize_reasoning_steps(steps: list[dict]) -> list[dict]:
 
 
 def _serialize_run(run_record) -> dict:
+    payload = run_record.input_payload or {}
     return {
         "run_id": run_record.id,
         "status": run_record.status,
         "steps": _sanitize_reasoning_steps(run_record.reasoning_steps),
-        "valuation_result": run_record.input_payload.get("valuation_result"),
+        "valuation_result": payload.get("valuation_result"),
+        "lbo_result": payload.get("lbo_result"),
         "error_message": run_record.error_message,
         "confidence_score": run_record.confidence_score,
     }
 
 
-def _execute_modeling_run(agent: FinancialModelingAgent) -> None:
+# ------------------------------------------------------------------
+# Agent dispatch table — maps (agent_type, task_name) to agent factory
+# ------------------------------------------------------------------
+AGENT_DISPATCH_MAP: dict[tuple[str, str], Any] = {
+    ("modeling", "dcf_model"):            lambda d, p: FinancialModelingAgent(d, p),
+    ("modeling", "lbo_model"):            lambda d, p: LBOModelingAgent(d, p),
+    ("pitchbook", "generate_pitchbook"):  lambda d, p: PitchbookAgent(d, p),
+    ("due_diligence", "dd_report"):       lambda d, p: DueDiligenceAgent(d, p),
+    ("research", "industry_brief"):       lambda d, p: ResearchAgent(d, p),
+    ("research", "buyer_universe"):       lambda d, p: ResearchAgent(d, p),
+    ("doc_drafter", "cim_draft"):         lambda d, p: DocDrafterAgent(d, p),
+    ("coordination", "extract_tasks"):    lambda d, p: CoordinationAgent(d, p),
+}
+
+
+def _execute_agent_run(agent: BaseAgent) -> None:
+    """Generic background executor for any BaseAgent subclass."""
     db = SessionLocal()
     try:
         agent.run()
@@ -64,6 +89,11 @@ def _execute_modeling_run(agent: FinancialModelingAgent) -> None:
         persist_run_bundle(db, agent.run_id)
     finally:
         db.close()
+
+
+def _execute_modeling_run(agent: FinancialModelingAgent) -> None:
+    """Kept for backward compatibility — delegates to generic executor."""
+    _execute_agent_run(agent)
 
 
 def _ensure_documents_ready_for_run(db: Session, deal_id: str) -> None:
@@ -123,15 +153,16 @@ async def dispatch_agent(
         target_agent = route.get("target_agent")
         target_task = route.get("target_task")
 
-        if target_agent == "modeling" and target_task == "dcf_model":
+        route_key = (target_agent, target_task)
+        if route_key in AGENT_DISPATCH_MAP:
             _ensure_documents_ready_for_run(db, deal_id)
             specialized_payload = payload.model_dump()
             specialized_payload["agent_type"] = target_agent
             specialized_payload["task_name"] = target_task
-            specialized_agent = FinancialModelingAgent(deal_id, specialized_payload)
+            specialized_agent = AGENT_DISPATCH_MAP[route_key](deal_id, specialized_payload)
             with SessionLocal() as persist_db:
                 persist_run_bundle(persist_db, specialized_agent.run_id)
-            _agent_pool.submit(_execute_modeling_run, specialized_agent)
+            _agent_pool.submit(_execute_agent_run, specialized_agent)
 
             run_record = store.agent_runs.get(specialized_agent.run_id)
             return APIResponse(
@@ -229,6 +260,7 @@ async def get_agent_run(
             "status": db_run.status,
             "steps": [],
             "valuation_result": (db_run.input_payload or {}).get("valuation_result"),
+            "lbo_result": (db_run.input_payload or {}).get("lbo_result"),
             "error_message": db_run.error_message,
             "confidence_score": db_run.confidence_score,
             "route": (db_run.input_payload or {}).get("route_decision", {}),

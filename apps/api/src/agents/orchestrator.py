@@ -7,22 +7,77 @@ from agents.base import BaseAgent
 class OrchestratorAgent(BaseAgent):
     # Canonical routes that the API can execute today.
     SUPPORTED_ROUTES = {
-        "modeling": {"dcf_model"},
+        "modeling":      {"dcf_model", "lbo_model"},
+        "pitchbook":     {"generate_pitchbook"},
+        "due_diligence": {"dd_report"},
+        "research":      {"industry_brief", "buyer_universe"},
+        "doc_drafter":   {"cim_draft"},
+        "coordination":  {"extract_tasks"},
     }
 
     TASK_ALIASES = {
+        # DCF
         "dcf": "dcf_model",
         "dcf_valuation": "dcf_model",
         "valuation": "dcf_model",
         "financial_model": "dcf_model",
+        # LBO
+        "lbo": "lbo_model",
+        "leveraged_buyout": "lbo_model",
+        "buyout": "lbo_model",
+        # Pitchbook
+        "pitchbook": "generate_pitchbook",
+        "pitch": "generate_pitchbook",
+        "pitch_deck": "generate_pitchbook",
+        # Due Diligence
+        "dd": "dd_report",
+        "due_diligence": "dd_report",
+        "diligence": "dd_report",
+        # Research
+        "research": "industry_brief",
+        "market_research": "industry_brief",
+        "buyers": "buyer_universe",
+        "buyer_list": "buyer_universe",
+        # CIM
+        "cim": "cim_draft",
+        "memo": "cim_draft",
+        "information_memo": "cim_draft",
+        # Coordination
+        "tasks": "extract_tasks",
+        "meeting_notes": "extract_tasks",
+        "action_items": "extract_tasks",
     }
 
     TASK_TO_AGENT_HINTS = {
+        # DCF
         "dcf_model": "modeling",
         "dcf": "modeling",
         "valuation": "modeling",
         "model": "modeling",
         "triangulate": "modeling",
+        # LBO
+        "lbo_model": "modeling",
+        "lbo": "modeling",
+        "leveraged_buyout": "modeling",
+        # Pitchbook
+        "generate_pitchbook": "pitchbook",
+        "pitchbook": "pitchbook",
+        "pitch": "pitchbook",
+        # DD
+        "dd_report": "due_diligence",
+        "dd": "due_diligence",
+        "due_diligence": "due_diligence",
+        # Research
+        "industry_brief": "research",
+        "buyer_universe": "research",
+        "research": "research",
+        # CIM
+        "cim_draft": "doc_drafter",
+        "cim": "doc_drafter",
+        # Coordination
+        "extract_tasks": "coordination",
+        "tasks": "coordination",
+        "meeting_notes": "coordination",
     }
 
     def __init__(self, deal_id: str, input_payload: Dict[str, Any]):

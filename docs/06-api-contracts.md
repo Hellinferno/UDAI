@@ -1,5 +1,5 @@
 # 06 — API Contracts
-## AI Investment Banking Analyst Agent (AIBAA)
+## AI Investment Banking Analyst Agent (AIBAA) — v2.0 (Enterprise Edition)
 
 ---
 
@@ -7,19 +7,24 @@
 
 This document defines all HTTP API contracts between:
 - **React SPA ↔ Orchestration Backend (FastAPI)**
-- **Orchestration Backend ↔ Colab LLM Inference Server**
+- **ARQ Worker ↔ LLM Provider APIs**
 
-**Base URL (Orchestration Backend):** `http://localhost:8000/api/v1`  
-**Base URL (Colab LLM Server):** `{COLAB_NGROK_URL}/api` (configured in settings)  
-**Protocol:** REST + Server-Sent Events (SSE) for streaming  
-**Content-Type:** `application/json` (except file uploads: `multipart/form-data`)  
-**Auth (v1):** None (single-user local deployment)
+**Base URL:** `http://localhost:8000/api/v1`
+**Protocol:** REST + Server-Sent Events (SSE) for streaming
+**Content-Type:** `application/json` (except file uploads: `multipart/form-data`)
+**Auth:** `Authorization: Bearer <jwt>` on all endpoints except `/auth/*`
+
+### Key API Design Principles (v2.0 changes)
+
+- **Idempotency:** All `POST`, `PUT`, `PATCH` requests accept an `Idempotency-Key` header. Duplicate requests within 24 hours return the original response.
+- **Org scoping:** All data is scoped to the authenticated user's `org_id`. Cross-tenant access is structurally impossible.
+- **Cursor pagination:** All list endpoints use cursor-based pagination (not offset) for consistency under concurrent inserts.
+- **Webhooks:** Registered endpoints receive HMAC-signed payloads on async task completion.
+- **Non-blocking agents:** Agent runs always return `202 Accepted` immediately. Results come via SSE stream or webhook.
 
 ---
 
 ## 2. Standard Response Envelope
-
-All responses follow this envelope:
 
 ```json
 {
@@ -28,7 +33,8 @@ All responses follow this envelope:
   "error": null,
   "meta": {
     "timestamp": "2025-01-15T10:30:00Z",
-    "request_id": "req_abc123"
+    "request_id": "req_abc123",
+    "api_version": "2.0"
   }
 }
 ```
@@ -52,9 +58,68 @@ All responses follow this envelope:
 
 ---
 
-## 3. Deals API
+## 3. Authentication API
+
+### `POST /auth/login` — Authenticate User
+
+**Request:**
+```json
+{
+  "email": "analyst@firm.com",
+  "password": "••••••••"
+}
+```
+
+**Response `200`:**
+```json
+{
+  "success": true,
+  "data": {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "token_type": "bearer",
+    "expires_in": 28800,
+    "requires_mfa": false,
+    "user": {
+      "id": "usr_abc123",
+      "email": "analyst@firm.com",
+      "org_id": "org_xyz789",
+      "role": "analyst"
+    }
+  }
+}
+```
+
+**Response `200` (MFA required):**
+```json
+{
+  "success": true,
+  "data": {
+    "mfa_token": "mfa_temp_abc123",
+    "requires_mfa": true
+  }
+}
+```
+
+### `POST /auth/mfa/verify` — Complete MFA
+
+**Request:**
+```json
+{ "mfa_token": "mfa_temp_abc123", "totp_code": "123456" }
+```
+
+**Response `200`:** Same as successful login — issues access_token.
+
+### `POST /auth/logout` — Invalidate Session
+
+Adds token to Redis blocklist. **Response `200`:** `{ "success": true }`.
+
+---
+
+## 4. Deals API
 
 ### `POST /deals` — Create a New Deal
+
+**Headers:** `Idempotency-Key: <client-generated-uuid>`
 
 **Request:**
 ```json
@@ -64,7 +129,7 @@ All responses follow this envelope:
   "deal_type": "ma_sellside",
   "industry": "Healthcare / Pharmaceuticals",
   "deal_stage": "preliminary",
-  "notes": "Sell-side mandate for founder-owned pharma company, ~$150M revenue"
+  "notes": "Sell-side mandate for founder-owned pharma, ~$150M revenue"
 }
 ```
 
@@ -74,12 +139,11 @@ All responses follow this envelope:
   "success": true,
   "data": {
     "id": "deal_9f3a1c2d",
+    "org_id": "org_xyz789",
     "name": "Project Falcon",
     "company_name": "Nexus Pharma Inc.",
     "deal_type": "ma_sellside",
-    "industry": "Healthcare / Pharmaceuticals",
     "deal_stage": "preliminary",
-    "notes": "...",
     "created_at": "2025-01-15T10:30:00Z",
     "document_count": 0,
     "output_count": 0
@@ -87,31 +151,21 @@ All responses follow this envelope:
 }
 ```
 
-**Validation Errors `422`:**
-```json
-{
-  "success": false,
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Validation failed",
-    "details": {
-      "company_name": ["Field is required"],
-      "deal_type": ["Invalid value. Must be one of: ma_buyside, ma_sellside, ipo, ..."]
-    }
-  }
-}
-```
+**Idempotent replay (duplicate Idempotency-Key within 24h):**
+- Returns original `201` response
+- Header `X-Idempotent-Replayed: true` is set
+- No new deal is created
 
 ---
 
-### `GET /deals` — List All Deals
+### `GET /deals` — List All Deals (cursor-based pagination)
 
 **Query Parameters:**
 | Param | Type | Default | Description |
 |---|---|---|---|
-| `status` | string | all | Filter by stage: preliminary / active / final / closed |
-| `limit` | int | 20 | Max results |
-| `offset` | int | 0 | Pagination offset |
+| `stage` | string | all | Filter by stage |
+| `limit` | int | 20 | Max results (max 100) |
+| `cursor` | string | null | Opaque cursor from previous response |
 | `sort` | string | created_at_desc | Sort order |
 
 **Response `200`:**
@@ -119,45 +173,29 @@ All responses follow this envelope:
 {
   "success": true,
   "data": {
-    "deals": [
-      {
-        "id": "deal_9f3a1c2d",
-        "name": "Project Falcon",
-        "company_name": "Nexus Pharma Inc.",
-        "deal_type": "ma_sellside",
-        "deal_stage": "preliminary",
-        "created_at": "2025-01-15T10:30:00Z",
-        "document_count": 5,
-        "output_count": 3,
-        "last_activity": "2025-01-15T14:22:00Z"
-      }
-    ],
-    "total": 1,
-    "limit": 20,
-    "offset": 0
+    "deals": [ ... ],
+    "cursor_next": "eyJjcmVhdGVkX2F0IjoiMjAyNS0wMS0xNSJ9",
+    "has_more": true,
+    "limit": 20
   }
 }
 ```
 
+*Cursor-based pagination ensures consistent results even as new deals are inserted between pages.*
+
 ---
 
 ### `GET /deals/:deal_id` — Get Deal Details
-
-**Response `200`:** Full deal object including embedded document list, output list, task list.
-
 ### `PATCH /deals/:deal_id` — Update Deal
-
-**Request:** Partial update of any deal field.
-
-### `DELETE /deals/:deal_id` — Archive Deal
-
-Soft-deletes (sets `is_archived = true`).
+### `DELETE /deals/:deal_id` — Archive Deal (soft-delete)
 
 ---
 
-## 4. Documents API
+## 5. Documents API
 
 ### `POST /deals/:deal_id/documents` — Upload Documents
+
+**Headers:** `Idempotency-Key: <uuid>`
 
 **Request:** `multipart/form-data`
 
@@ -165,6 +203,7 @@ Soft-deletes (sets `is_archived = true`).
 |---|---|---|
 | `files` | File[] | One or more files (.pdf, .docx, .xlsx, .csv) |
 | `category` | string | Optional: 'financial', 'legal', 'corporate', 'tax', 'operational' |
+| `data_classification` | string | Optional: 'public', 'internal', 'confidential', 'mnpi' — defaults to 'internal' |
 
 **Response `201`:**
 ```json
@@ -177,7 +216,9 @@ Soft-deletes (sets `is_archived = true`).
         "filename": "income_statement_2024.xlsx",
         "file_type": "xlsx",
         "file_size_bytes": 45231,
+        "data_classification": "confidential",
         "parse_status": "processing",
+        "rag_status": "pending",
         "uploaded_at": "2025-01-15T10:35:00Z"
       }
     ],
@@ -186,52 +227,51 @@ Soft-deletes (sets `is_archived = true`).
 }
 ```
 
+RAG indexing begins as a background job after parse completes. Poll `GET /deals/:id/documents` for `rag_status = 'indexed'` before running agents.
+
+### `PATCH /deals/:deal_id/documents/:doc_id` — Update Document Metadata
+
+Used to update `data_classification` (e.g., flag as MNPI post-upload).
+
+**Request:** `{ "data_classification": "mnpi" }`
+
 ---
 
 ### `GET /deals/:deal_id/documents` — List Documents
-
-**Response `200`:** Array of document objects with parse_status.
-
 ### `DELETE /deals/:deal_id/documents/:doc_id` — Delete Document
-
-### `GET /deals/:deal_id/documents/:doc_id/text` — Get Parsed Text
-
-Returns extracted plain text content for a document (used internally by agents).
+### `GET /deals/:deal_id/documents/:doc_id/text` — Get Parsed Text (internal use)
 
 ---
 
-## 5. Agent API
+## 6. Agent API
 
 ### `POST /deals/:deal_id/agents/run` — Trigger Agent Run
 
-This is the primary endpoint. The frontend calls this to invoke any agent.
+**Headers:** `Idempotency-Key: <uuid>`
 
 **Request:**
 ```json
 {
   "agent_type": "modeling",
   "task_name": "dcf_model",
+  "mnpi_consent": false,
   "parameters": {
     "model_type": "dcf",
     "projection_years": 5,
     "wacc_override": null,
     "terminal_growth_rate": 0.025,
-    "document_ids": ["doc_a1b2c3", "doc_d4e5f6"],
-    "additional_context": "Company operates in high-growth SaaS segment with 35% YoY revenue growth"
+    "use_mid_year_discounting": true,
+    "document_ids": ["doc_a1b2c3"],
+    "additional_context": "High-growth SaaS, 35% YoY revenue growth"
   }
 }
 ```
 
-**Valid `agent_type` values:**
-- `orchestrator` — Routes to correct agent automatically
-- `modeling` — Financial modeling
-- `pitchbook` — Presentation generation
-- `due_diligence` — Document review and risk flagging
-- `research` — Market and industry research
-- `doc_drafter` — CIM and deal document writing
-- `coordination` — Meeting notes and task tracking
+**`mnpi_consent` field:**
+- If any document in scope has `data_classification = 'mnpi'`, the server returns `403 MNPI_CONSENT_REQUIRED` unless `mnpi_consent: true` is set.
+- Setting `mnpi_consent: true` records the consent in the agent_run and audit log.
 
-**Valid `task_name` values per agent:**
+**Valid `agent_type` + `task_name` matrix:**
 
 | agent_type | task_name options |
 |---|---|
@@ -248,6 +288,7 @@ This is the primary endpoint. The frontend calls this to invoke any agent.
   "success": true,
   "data": {
     "run_id": "run_x7y8z9",
+    "arq_job_id": "arq_job_abc123",
     "agent_type": "modeling",
     "task_name": "dcf_model",
     "status": "queued",
@@ -257,104 +298,16 @@ This is the primary endpoint. The frontend calls this to invoke any agent.
 }
 ```
 
-### Modeling Task Parameters (`agent_type=modeling`, `task_name=dcf_model`)
-
-The following optional parameters are now supported for advanced scenario and risk analysis:
-
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `scenario_probability_weights` | object | `{ "bear": 0.25, "base": 0.50, "bull": 0.25 }` | Probability weights for scenario-planning expected value. Weights are normalized server-side. |
-| `monte_carlo_iterations` | int | `1500` | Number of Monte Carlo paths (`>= 100`). |
-| `monte_carlo_seed` | int | `42` | Random seed for deterministic replay. |
-| `monte_carlo_growth_volatility` | float | `0.015` | Std-dev of growth shock. |
-| `monte_carlo_margin_volatility` | float | `0.04` | Std-dev of margin shock. |
-| `monte_carlo_wacc_volatility` | float | `0.01` | Std-dev of WACC shock. |
-| `monte_carlo_tgr_volatility` | float | `0.003` | Std-dev of terminal-growth shock. |
-| `monte_carlo_var_confidence_level` | float | `0.95` | Tail confidence for VaR/CVaR reporting. Accepted range: `0.80` to `0.995`. |
-| `monte_carlo_correlation_matrix` | object | internal default | Optional correlation matrix across factors `growth`, `margin`, `wacc`, `tgr`. |
-
-`monte_carlo_correlation_matrix` shape example:
+**Response `403` (MNPI consent required):**
 ```json
 {
-  "growth": { "margin": 0.60, "wacc": -0.40, "tgr": 0.30 },
-  "margin": { "wacc": -0.20, "tgr": 0.20 },
-  "wacc": { "tgr": 0.50 }
-}
-```
-
-### Modeling Result Contract Additions
-
-When run details include valuation output, the object now contains a `parallel_analysis` block with worker-level outputs:
-
-```json
-{
-  "parallel_analysis": {
-    "dcf_worker": {
-      "enterprise_value": 12345.67,
-      "equity_value": 11234.56,
-      "implied_share_price": 145.12,
-      "wacc": 0.112,
-      "terminal_growth_rate": 0.03
-    },
-    "comps_worker": {
-      "method": "ev_ebitda_comps",
-      "industry": "IT Services",
-      "multiple_band": { "bear": 14.0, "base": 18.0, "bull": 22.0 },
-      "scenarios": { "bear": {}, "base": {}, "bull": {} }
-    },
-    "financial_statement_worker": {
-      "industry_context": "technology",
-      "ratios": {},
-      "analysis": {
-        "overall_health": { "status": "Good", "score": 2.75 },
-        "recommendations": []
-      },
-      "trend_analysis": {
-        "signal": "Improving",
-        "score": 2,
-        "metrics": {
-          "current_ratio": { "signal": "Improving", "start": 1.4, "end": 2.1, "series": [1.4, 1.8, 2.1] },
-          "debt_to_equity": { "signal": "Improving", "start": 0.9, "end": 0.4, "series": [0.9, 0.6, 0.4] }
-        },
-        "period_count": 3
-      }
-    },
-    "scenario_planning_worker": {
-      "expected_value": 105.0,
-      "weights": { "bear": 0.2, "base": 0.5, "bull": 0.3 },
-      "metric": "share_price",
-      "details": []
-    },
-    "monte_carlo_worker": {
-      "iterations": 1500,
-      "metric": "share_price",
-      "summary": {
-        "mean": 147.9,
-        "median": 145.8,
-        "p5": 113.4,
-        "p95": 185.1,
-        "probability_of_loss": 0.02,
-        "var_confidence_level": 0.95,
-        "var_value": 113.4,
-        "cvar_value": 106.2,
-        "var_downside_from_mean": 34.5,
-        "cvar_downside_from_mean": 41.7
-      },
-      "distribution_preview": {
-        "min": 92.1,
-        "max": 223.8,
-        "sample": [92.1, 104.4, 118.8]
-      },
-      "assumptions": {
-        "growth_volatility": 0.015,
-        "margin_volatility": 0.04,
-        "wacc_volatility": 0.01,
-        "tgr_volatility": 0.003,
-        "seed": 42,
-        "correlation_matrix": [[1.0, 0.45, -0.35, 0.2], [0.45, 1.0, -0.25, 0.15], [-0.35, -0.25, 1.0, 0.4], [0.2, 0.15, 0.4, 1.0]]
-      }
-    },
-    "synthesis": "Parallel synthesis complete..."
+  "success": false,
+  "error": {
+    "code": "MNPI_CONSENT_REQUIRED",
+    "message": "This run uses documents classified as MNPI. Resend with mnpi_consent: true to confirm.",
+    "details": {
+      "mnpi_documents": ["doc_a1b2c3"]
+    }
   }
 }
 ```
@@ -363,31 +316,41 @@ When run details include valuation output, the object now contains a `parallel_a
 
 ### `GET /agents/runs/:run_id/stream` — Stream Agent Progress (SSE)
 
-**Protocol:** Server-Sent Events  
+**Protocol:** Server-Sent Events
 **Content-Type:** `text/event-stream`
+**Auth:** Bearer token in query param `?token=<jwt>` (SSE cannot send custom headers)
+
+**Reconnect behaviour:** On reconnect, client sends `Last-Event-ID` header. Server replays all events since that ID. If `Last-Event-ID` is absent, replays all events from the start of the run.
 
 **Event Types:**
 ```
+id: evt_001
 event: step
-data: {"step": 1, "type": "thought", "content": "Parsing income statement from uploaded Excel file..."}
+data: {"step": 1, "type": "thought", "content": "Retrieving context for DCF model..."}
 
+id: evt_002
 event: step
-data: {"step": 2, "type": "action", "content": "Calling tool: parse_excel", "tool_input": "income_statement_2024.xlsx"}
+data: {"step": 2, "type": "rag_retrieval", "content": "Retrieved 10 chunks from income_statement_2024.xlsx", "chunk_count": 10}
 
+id: evt_003
 event: step
-data: {"step": 3, "type": "observation", "content": "Extracted 5 years of revenue data: [12.5M, 17.8M, 24.1M, 31.5M, 40.2M]"}
+data: {"step": 3, "type": "action", "content": "Calling tool: computation_engine.dcf"}
 
+id: evt_004
 event: step
-data: {"step": 4, "type": "thought", "content": "Revenue CAGR is 33.9%. Applying DCF methodology with WACC=10%..."}
+data: {"step": 4, "type": "observation", "content": "DCF computed: EV = $285M, implied share price = $28.50"}
 
+id: evt_005
 event: progress
-data: {"percent_complete": 65, "current_step": "Building DCF sensitivity table"}
+data: {"percent_complete": 80, "current_step": "Building sensitivity table"}
 
+id: evt_006
 event: complete
-data: {"run_id": "run_x7y8z9", "status": "completed", "output_id": "out_p1q2r3", "confidence_score": 0.87}
+data: {"run_id": "run_x7y8z9", "status": "completed", "output_id": "out_p1q2r3", "confidence_score": 0.87, "hallucination_flags": 0}
 
+id: evt_007
 event: error
-data: {"run_id": "run_x7y8z9", "status": "failed", "error_code": "LLM_TIMEOUT", "message": "LLM inference server did not respond"}
+data: {"run_id": "run_x7y8z9", "status": "failed", "error_code": "LLM_UNAVAILABLE", "message": "LLM service returned 503"}
 ```
 
 ---
@@ -402,14 +365,19 @@ data: {"run_id": "run_x7y8z9", "status": "failed", "error_code": "LLM_TIMEOUT", 
     "id": "run_x7y8z9",
     "deal_id": "deal_9f3a1c2d",
     "agent_type": "modeling",
+    "agent_version": "1.0.0",
     "task_name": "dcf_model",
     "status": "completed",
+    "llm_backend": "anthropic",
+    "llm_model": "claude-opus-4-6",
     "reasoning_steps": [
       {"step": 1, "type": "thought", "content": "..."},
-      {"step": 2, "type": "action", "content": "...", "tool": "parse_excel"},
-      {"step": 3, "type": "observation", "content": "..."}
+      {"step": 2, "type": "rag_retrieval", "chunk_count": 10},
+      {"step": 3, "type": "action", "tool": "dcf_engine"}
     ],
+    "rag_chunks_used": ["doc_a1b2c3_chunk_0", "doc_a1b2c3_chunk_3"],
     "confidence_score": 0.87,
+    "mnpi_consent": false,
     "started_at": "2025-01-15T10:36:05Z",
     "completed_at": "2025-01-15T10:37:42Z",
     "duration_seconds": 97,
@@ -420,156 +388,178 @@ data: {"run_id": "run_x7y8z9", "status": "failed", "error_code": "LLM_TIMEOUT", 
 
 ---
 
-## 6. Outputs API
+## 7. Outputs API
 
 ### `GET /deals/:deal_id/outputs` — List Outputs
-
-**Response `200`:** Array of output objects.
-
 ### `GET /outputs/:output_id` — Get Output Metadata
-
 ### `GET /outputs/:output_id/download` — Download Output File
 
-**Response:** Binary file stream with appropriate `Content-Type` and `Content-Disposition: attachment` headers.
+**Response:** Binary file stream with `Content-Type` and `Content-Disposition: attachment` headers.
 
 ### `PATCH /outputs/:output_id/review` — Update Review Status
+
+**Headers:** `Idempotency-Key: <uuid>`
 
 **Request:**
 ```json
 {
   "review_status": "approved",
-  "reviewer_notes": "Looks good, minor formatting adjustment needed on sensitivity table"
+  "reviewer_notes": "Verified against source — approved for client delivery"
 }
 ```
-
-**Valid `review_status` values:** `approved`, `revision_requested`, `archived`
-
----
 
 ### `POST /outputs/:output_id/revise` — Request Revision
 
 **Request:**
 ```json
 {
-  "revision_instructions": "Change the discount rate assumption from 10% to 12% and regenerate the sensitivity table",
+  "revision_instructions": "Change WACC assumption from 10% to 12%",
   "sections": ["assumptions", "sensitivity_table"]
 }
 ```
 
-**Response:** New `AgentRun` object (same as `/agents/run` response).
+**Response `202`:** New `AgentRun` object — same structure as `/agents/run` response.
 
 ---
 
-## 7. Tasks API
+## 8. Tasks API
 
 ### `GET /deals/:deal_id/tasks` — List Tasks
 
+**Query Parameters:** `status` (filter), `limit`, `cursor`
+
 ### `POST /deals/:deal_id/tasks` — Create Manual Task
+
+**Headers:** `Idempotency-Key: <uuid>`
 
 **Request:**
 ```json
 {
   "title": "Send NDA to potential buyer",
-  "description": "Draft and send NDA to Apollo Management contact",
   "owner": "John Smith",
   "priority": "high",
   "due_date": "2025-01-20"
 }
 ```
 
-### `PATCH /tasks/:task_id` — Update Task Status
+### `PATCH /tasks/:task_id` — Update Task
+
+---
+
+## 9. Webhook API *(NEW)*
+
+### `POST /webhooks` — Register Webhook Endpoint
 
 **Request:**
 ```json
 {
-  "status": "completed",
-  "owner": "John Smith"
+  "name": "Slack Notifications",
+  "url": "https://hooks.slack.com/services/...",
+  "events": ["agent.completed", "output.approved", "agent.failed"]
 }
 ```
 
+**Response `201`:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "wh_abc123",
+    "name": "Slack Notifications",
+    "url": "https://hooks.slack.com/...",
+    "events": ["agent.completed", "output.approved", "agent.failed"],
+    "secret": "whsec_abcdefg123456",
+    "is_active": true
+  }
+}
+```
+
+The `secret` is returned only on creation. Store it — it is used to verify HMAC signatures on delivered payloads.
+
+### `GET /webhooks` — List Webhook Endpoints
+### `DELETE /webhooks/:webhook_id` — Delete Webhook
+
+### Webhook Payload Format
+
+Delivered via `POST` to the registered URL:
+
+```json
+{
+  "event": "agent.completed",
+  "timestamp": "2025-01-15T10:37:42Z",
+  "data": {
+    "run_id": "run_x7y8z9",
+    "deal_id": "deal_9f3a1c2d",
+    "agent_type": "modeling",
+    "task_name": "dcf_model",
+    "status": "completed",
+    "output_id": "out_p1q2r3",
+    "confidence_score": 0.87
+  }
+}
+```
+
+**Signature verification:**
+```
+X-AIBAA-Signature: sha256=<hex>
+X-AIBAA-Event: agent.completed
+X-AIBAA-Delivery: del_abc123
+```
+
+Compute: `HMAC-SHA256(webhook_secret, raw_request_body)` and compare to the `sha256=` value.
+
+**Retry policy:** On non-2xx response, retry at 1min, 5min, 30min, 2hr intervals. After 5 consecutive failures, the endpoint is deactivated and the org is notified.
+
 ---
 
-## 8. Settings API
+## 10. Admin API *(NEW)*
 
-### `GET /settings` — Get All Settings
+### `GET /admin/audit` — List Audit Events (org admin only)
 
+**Query Parameters:** `event_type`, `user_id`, `from`, `to`, `cursor`, `limit`
+
+### `GET /admin/audit/export` — Export Audit Trail as signed CSV
+
+**Response:** CSV file with all audit events and integrity hashes. The server validates the hash chain before generating the export — if any tampering is detected, the response includes a `chain_integrity_warning`.
+
+### `GET /admin/users` — List Org Users
+### `POST /admin/users/invite` — Invite User to Org
+### `DELETE /admin/users/:user_id` — Deactivate User
+
+---
+
+## 11. Settings API
+
+### `GET /settings` — Get All Settings for Current Org
 ### `PUT /settings/:key` — Update a Setting
 
-**Request:**
-```json
-{
-  "value": "https://abc123.ngrok.io"
-}
-```
-
-**Critical settings:**
-- `llm_endpoint_url` — Colab ngrok URL
+**Request:** `{ "value": "anthropic" }`
 
 ---
 
-## 9. Colab LLM Inference API (Internal)
-
-This API is exposed by the FastAPI server running in Google Colab.
-
-### `POST /generate` — Generate LLM Completion
-
-**Request:**
-```json
-{
-  "prompt": "You are a senior Investment Banking Analyst...\n\nTask: Build a 5-year DCF model...",
-  "system_prompt": "You are an expert investment banking analyst...",
-  "max_tokens": 4096,
-  "temperature": 0.2,
-  "stream": false,
-  "response_format": "json"
-}
-```
-
-**Response `200`:**
-```json
-{
-  "completion": "{ \"revenue_projections\": [40.2, 53.5, 68.9, 87.1, 107.5], \"wacc\": 0.10, ... }",
-  "tokens_used": {
-    "prompt": 1247,
-    "completion": 892,
-    "total": 2139
-  },
-  "model": "llama3-8b-ib-analyst",
-  "latency_ms": 4231
-}
-```
-
-### `GET /health` — Health Check
-
-**Response `200`:**
-```json
-{
-  "status": "healthy",
-  "model_loaded": true,
-  "model_name": "llama3-8b-ib-analyst",
-  "gpu_memory_used_gb": 6.2,
-  "gpu_memory_total_gb": 15.0
-}
-```
-
----
-
-## 10. Error Codes Reference
+## 12. Error Codes Reference
 
 | Code | HTTP Status | Description |
 |---|---|---|
 | `VALIDATION_ERROR` | 422 | Request body failed validation |
-| `DEAL_NOT_FOUND` | 404 | Deal ID does not exist |
+| `UNAUTHORIZED` | 401 | Missing or invalid JWT |
+| `FORBIDDEN` | 403 | Authenticated but not authorised for this resource |
+| `MNPI_CONSENT_REQUIRED` | 403 | Run uses MNPI documents — consent required |
+| `DEAL_NOT_FOUND` | 404 | Deal ID does not exist (or belongs to different org) |
 | `DOCUMENT_NOT_FOUND` | 404 | Document ID does not exist |
 | `RUN_NOT_FOUND` | 404 | Agent run ID does not exist |
 | `OUTPUT_NOT_FOUND` | 404 | Output ID does not exist |
 | `UNSUPPORTED_FILE_TYPE` | 400 | Uploaded file type not supported |
 | `FILE_TOO_LARGE` | 413 | File exceeds 50MB limit |
-| `AGENT_UNAVAILABLE` | 503 | LLM backend is offline |
+| `DOCUMENTS_NOT_INDEXED` | 409 | Relevant documents are still being indexed — retry shortly |
+| `AGENT_UNAVAILABLE` | 503 | LLM provider is offline or unreachable |
 | `AGENT_TIMEOUT` | 504 | Agent did not complete in time |
 | `AGENT_ERROR` | 500 | Agent encountered an internal error |
 | `HALLUCINATION_GUARD` | 200 | Output flagged for low confidence (non-blocking) |
 | `PARSE_FAILED` | 422 | Document could not be parsed |
+| `PROMPT_INJECTION_DETECTED` | 400 | Input contained likely prompt injection — sanitised |
+| `RATE_LIMIT_EXCEEDED` | 429 | Too many requests — includes `Retry-After` header |
+| `IDEMPOTENCY_CONFLICT` | 409 | Idempotency key already used with different request body |
 
 ---
 

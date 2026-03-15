@@ -1,11 +1,11 @@
 # 11 — Environment & DevOps
-## AI Investment Banking Analyst Agent (AIBAA)
+## AI Investment Banking Analyst Agent (AIBAA) — v2.0 (Enterprise Edition)
 
 ---
 
 ## 1. Overview
 
-This document covers all environment configurations, tooling, local development setup, and deployment procedures for AIBAA. Since v1 runs locally + Google Colab, there is no cloud infrastructure to configure — but the setup must be deterministic and repeatable.
+This document covers all environment configurations, tooling, local development setup, and deployment procedures. The entire stack runs via `docker compose up` — no manual Python virtualenv setup, no manual database creation, no "works on my machine."
 
 ---
 
@@ -13,311 +13,361 @@ This document covers all environment configurations, tooling, local development 
 
 | Environment | Purpose | Infrastructure |
 |---|---|---|
-| `local` | Daily development + testing | Local machine + Colab |
-| `colab` | LLM inference | Google Colab (T4/A100 GPU) |
-| `staging` (v2) | Pre-production testing | TBD (Render / Railway) |
-| `production` (v3) | Live user deployment | TBD (AWS / GCP) |
+| `local` | Daily development | Docker Compose (all services) |
+| `staging` (v2) | Pre-production testing | Railway / Render / Fly.io |
+| `production` (v2+) | Live deployment | AWS / GCP with managed Postgres, Redis, S3 |
 
 ---
 
-## 3. System Requirements
+## 3. System Requirements (Host Machine)
 
-### Developer Machine
 | Component | Minimum | Recommended |
 |---|---|---|
 | OS | macOS 13 / Ubuntu 22.04 / Windows 11 + WSL2 | macOS 14 / Ubuntu 24.04 |
 | RAM | 8 GB | 16 GB |
-| Disk | 10 GB free | 20 GB free |
-| Python | 3.11+ | 3.11.6 |
-| Node.js | 18+ | 20 LTS |
-| pnpm | 8+ | 8.11.0 |
+| Disk | 15 GB free | 30 GB free |
+| Docker Desktop | 4.20+ | Latest |
 | Git | 2.40+ | Latest |
 
-### Google Colab
-| Component | Free Tier | Pro Tier (Recommended) |
-|---|---|---|
-| GPU | NVIDIA T4 (15 GB VRAM) | NVIDIA A100 (40 GB VRAM) |
-| RAM | 12 GB | 25 GB |
-| Storage | 100 GB (ephemeral) | 100 GB |
-| Session Limit | ~12 hours | ~24 hours |
-
-> **Recommendation:** Colab Pro ($10/month) is strongly recommended for running Llama-3-8B with Unsloth. Free tier may experience OOM errors.
+No Python, Node, or PostgreSQL installation required on the host — Docker handles everything.
 
 ---
 
-## 4. Local Development Setup
+## 4. Docker Compose Configuration
 
-### 4.1 One-Time Setup
+```yaml
+# docker-compose.yml
+version: "3.9"
 
-```bash
-# Clone the repository
-git clone https://github.com/your-org/aibaa.git
-cd aibaa
+services:
 
-# Copy environment variables
-cp .env.example .env
-# Edit .env with your values (see section 5 below)
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://aibaa:secret@db:5432/aibaa
+      - REDIS_URL=redis://redis:6379
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8001
+    depends_on:
+      db:     { condition: service_healthy }
+      redis:  { condition: service_healthy }
+      chroma: { condition: service_started }
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
 
-# Install Python dependencies (backend)
-cd apps/api
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    command: python -m arq worker.src.main.WorkerSettings
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://aibaa:secret@db:5432/aibaa
+      - REDIS_URL=redis://redis:6379
+      - CHROMA_HOST=chroma
+      - CHROMA_PORT=8001
+    depends_on:
+      db:    { condition: service_healthy }
+      redis: { condition: service_healthy }
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+      # Mount shared Python packages from monorepo root
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./rag:/app/rag
+      - ./security:/app/security
+      - ./computation:/app/computation
 
-# Install Node dependencies (frontend)
-cd ../../apps/web
-npm install -g pnpm             # if not already installed
-pnpm install
+  web:
+    build:
+      context: apps/web
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api/v1
 
-# Return to root
-cd ../..
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: aibaa
+      POSTGRES_USER: aibaa
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aibaa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  chroma:
+    image: chromadb/chroma:0.4.18
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma_data:/chroma/.chroma
+
+volumes:
+  postgres_data:
+  redis_data:
+  chroma_data:
 ```
 
-### 4.2 Starting the Full Stack
-
-**Terminal 1 — Backend:**
-```bash
-cd apps/api
-source venv/bin/activate
-uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+```yaml
+# docker-compose.override.yml (development — hot reload)
+services:
+  api:
+    command: uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
+    volumes:
+      - ./apps/api/src:/app/src      # Hot reload Python
+      - ./agents:/app/agents
+      - ./tools:/app/tools
+      - ./rag:/app/rag
+      - ./security:/app/security
+      - ./computation:/app/computation
+  web:
+    command: pnpm dev --host
+    volumes:
+      - ./apps/web/src:/app/src      # Hot reload TypeScript
 ```
-
-**Terminal 2 — Frontend:**
-```bash
-cd apps/web
-pnpm dev
-# App available at http://localhost:3000
-```
-
-**Terminal 3 — Colab (via browser):**
-1. Open `colab/notebooks/03_start_inference_server.ipynb` in Google Colab
-2. Run all cells
-3. Copy the ngrok URL output (e.g., `https://abc123.ngrok.io`)
-4. Paste into `apps/api/.env` as `LLM_ENDPOINT_URL`
-5. Or: update via the Settings page in the UI
 
 ---
 
-## 5. Environment Variables
+## 5. Dockerfiles
 
-### `apps/api/.env`
+### `apps/api/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev gcc curl && rm -rf /var/lib/apt/lists/*
+
+COPY apps/api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy shared packages from monorepo root
+COPY agents/ ./agents/
+COPY tools/ ./tools/
+COPY rag/ ./rag/
+COPY security/ ./security/
+COPY computation/ ./computation/
+
+COPY apps/api/src/ ./src/
+COPY apps/api/alembic/ ./alembic/
+COPY apps/api/alembic.ini .
+
+# Run database migrations on startup, then start server
+CMD alembic upgrade head && uvicorn src.main:app --host 0.0.0.0 --port 8000
+
+RUN useradd -m -u 1001 appuser && chown -R appuser /app
+USER appuser
+```
+
+### `worker/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq-dev gcc && rm -rf /var/lib/apt/lists/*
+
+COPY worker/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY agents/ ./agents/
+COPY tools/ ./tools/
+COPY rag/ ./rag/
+COPY security/ ./security/
+COPY computation/ ./computation/
+COPY worker/src/ ./worker/src/
+
+CMD ["python", "-m", "arq", "worker.src.main.WorkerSettings"]
+
+RUN useradd -m -u 1001 appuser && chown -R appuser /app
+USER appuser
+```
+
+### `apps/web/Dockerfile`
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+RUN npm install -g pnpm
+COPY apps/web/package.json apps/web/pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY apps/web/ .
+RUN pnpm build
+
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+COPY apps/web/nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+```
+
+---
+
+## 6. Environment Variables
+
+### `.env` (copy from `.env.example`, never commit)
 
 ```bash
 # ============================================================
-# AIBAA — Backend Environment Variables
+# AIBAA — Environment Variables
 # ============================================================
 
 # Application
-APP_ENV=local
-APP_PORT=8000
-APP_HOST=0.0.0.0
+APP_ENV=local                           # local | staging | production
 LOG_LEVEL=INFO
 
-# LLM Inference (Colab)
-LLM_ENDPOINT_URL=https://abc123.ngrok.io    # Update after each Colab session
-LLM_MODEL_NAME=llama3-8b-ib-analyst
+# ── LLM Backend ──────────────────────────────────────────────
+LLM_BACKEND=anthropic                   # anthropic | openai | colab
+ANTHROPIC_API_KEY=sk-ant-...            # Required if LLM_BACKEND=anthropic
+OPENAI_API_KEY=sk-...                   # Required if LLM_BACKEND=openai
+LLM_MODEL=claude-opus-4-6               # Model name for the selected provider
 LLM_MAX_TOKENS=4096
 LLM_TEMPERATURE=0.2
-LLM_REQUEST_TIMEOUT_SECONDS=300             # 5 minutes max
+# LLM_ENDPOINT_URL=                     # Only needed if LLM_BACKEND=colab
 
-# File Storage
-UPLOAD_DIR=./uploads                         # Local directory for uploaded files
-OUTPUT_DIR=./outputs                         # Local directory for generated files
-MAX_UPLOAD_SIZE_MB=50
+# ── Auth ─────────────────────────────────────────────────────
+JWT_SECRET_KEY=                         # Generate: openssl rand -hex 32
+JWT_ALGORITHM=HS256
+JWT_EXPIRY_HOURS=8
 
-# Agent Settings
-HALLUCINATION_GUARD_ENABLED=true
-AGENT_MAX_RETRIES=2
-AGENT_STEP_TIMEOUT_SECONDS=60
+# ── Database ─────────────────────────────────────────────────
+# Overridden by docker-compose.yml for local dev
+DATABASE_URL=sqlite+aiosqlite:///./aibaa.db
 
-# Security (v1 — no auth)
-# AUTH_SECRET=  (deferred to v2)
+# ── Redis ────────────────────────────────────────────────────
+REDIS_URL=redis://localhost:6379
 
-# CORS
-CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
-```
+# ── ChromaDB ─────────────────────────────────────────────────
+CHROMA_HOST=localhost
+CHROMA_PORT=8001
 
-### `apps/web/.env`
-
-```bash
-# ============================================================
-# AIBAA — Frontend Environment Variables
-# ============================================================
-
-VITE_API_BASE_URL=http://localhost:8000/api/v1
-VITE_APP_NAME=AIBAA
-VITE_APP_VERSION=1.0.0
-VITE_DISCLAIMER_TEXT=This document is an AI-generated draft for informational purposes only and does not constitute financial, legal, or investment advice.
-```
-
-### `.env.example` (committed to repo)
-
-```bash
-# Copy this file to apps/api/.env and apps/web/.env
-# Fill in your values
-
-# Backend
-APP_ENV=local
-LLM_ENDPOINT_URL=https://your-ngrok-url.ngrok.io
-LLM_MODEL_NAME=llama3-8b-ib-analyst
+# ── File Storage ─────────────────────────────────────────────
 UPLOAD_DIR=./uploads
 OUTPUT_DIR=./outputs
+MAX_UPLOAD_SIZE_MB=50
+DATA_RETENTION_DAYS=2555                # 7 years regulatory minimum
 
-# Frontend
-VITE_API_BASE_URL=http://localhost:8000/api/v1
+# ── Security ─────────────────────────────────────────────────
+CORS_ORIGINS=http://localhost:3000      # Comma-separated; never * in production
+RATE_LIMIT_REQUESTS_PER_MINUTE=60
+MNPI_CONSENT_REQUIRED=true
+
+# ── Compliance ───────────────────────────────────────────────
+HALLUCINATION_GUARD_ENABLED=true
+
+# ── Observability ────────────────────────────────────────────
+SENTRY_DSN=                             # Leave blank to disable
+
+# ── Webhooks ─────────────────────────────────────────────────
+WEBHOOK_MAX_RETRIES=5
+WEBHOOK_RETRY_DELAYS_SECONDS=60,300,1800,7200,86400
 ```
 
-> `.env` files are in `.gitignore`. Never commit real values.
+### `.env.example` (committed to repo — safe template)
 
----
-
-## 6. Google Colab Setup
-
-### 6.1 Colab Notebook: Environment Setup (`01_environment_setup.ipynb`)
-
-```python
-# Cell 1: Install dependencies
-!pip install "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-!pip install fastapi uvicorn pyngrok nest-asyncio
-
-# Cell 2: Verify GPU
-import torch
-print(f"GPU: {torch.cuda.get_device_name(0)}")
-print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+```bash
+LLM_BACKEND=anthropic
+ANTHROPIC_API_KEY=                      # Your Anthropic API key
+JWT_SECRET_KEY=                         # openssl rand -hex 32
+DATABASE_URL=sqlite+aiosqlite:///./aibaa.db
+REDIS_URL=redis://localhost:6379
+CHROMA_HOST=localhost
+CHROMA_PORT=8001
+UPLOAD_DIR=./uploads
+OUTPUT_DIR=./outputs
+CORS_ORIGINS=http://localhost:3000
+SENTRY_DSN=
 ```
 
-### 6.2 Colab Notebook: Load Model (`02_load_model.ipynb`)
-
-```python
-# Cell 1: Load model with Unsloth 4-bit quantization
-from unsloth import FastLanguageModel
-import torch
-
-model, tokenizer = FastLanguageModel.from_pretrained(
-    model_name = "unsloth/Meta-Llama-3-8B-Instruct",  # Base model
-    # OR: your fine-tuned LoRA model path after training
-    max_seq_length = 4096,
-    dtype = None,          # Auto-detect: float16 on T4, bfloat16 on A100
-    load_in_4bit = True,   # Reduces VRAM from ~16GB to ~6GB
-)
-
-FastLanguageModel.for_inference(model)
-print("Model loaded successfully!")
-```
-
-### 6.3 Colab Notebook: Start Inference Server (`03_start_inference_server.ipynb`)
-
-```python
-# Cell 1: Import and configure
-import nest_asyncio
-nest_asyncio.apply()
-
-from fastapi import FastAPI
-from pydantic import BaseModel
-import uvicorn
-from pyngrok import ngrok
-
-app = FastAPI()
-
-class GenerateRequest(BaseModel):
-    prompt: str
-    system_prompt: str = ""
-    max_tokens: int = 4096
-    temperature: float = 0.2
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "model_loaded": True, "model_name": "llama3-8b-ib-analyst"}
-
-@app.post("/generate")
-async def generate(request: GenerateRequest):
-    messages = []
-    if request.system_prompt:
-        messages.append({"role": "system", "content": request.system_prompt})
-    messages.append({"role": "user", "content": request.prompt})
-    
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(text, return_tensors="pt").to("cuda")
-    
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=request.max_tokens,
-            temperature=request.temperature,
-            do_sample=True,
-        )
-    
-    completion = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-    
-    return {
-        "completion": completion,
-        "tokens_used": {
-            "prompt": inputs.input_ids.shape[1],
-            "completion": len(outputs[0]) - inputs.input_ids.shape[1],
-            "total": len(outputs[0])
-        },
-        "model": "llama3-8b-ib-analyst"
-    }
-
-# Cell 2: Start ngrok + uvicorn
-ngrok_tunnel = ngrok.connect(8001)
-print(f"\n🚀 Inference server live at: {ngrok_tunnel.public_url}")
-print("📋 Copy this URL into your .env as LLM_ENDPOINT_URL\n")
-
-uvicorn.run(app, host="0.0.0.0", port=8001)
-```
+**Rules:**
+- `.env` is in `.gitignore`. Never commit it.
+- Production secrets are injected via the deployment platform (Railway env vars, AWS Parameter Store, etc.) — never via `.env` files on servers.
+- `git secrets --scan` runs in pre-commit hook to catch accidental secret commits.
 
 ---
 
 ## 7. Makefile Commands
 
 ```makefile
-# Root Makefile
-.PHONY: help install dev test lint clean
+.PHONY: help up down build test lint migrate clean secrets-check
 
 help:
 	@echo "AIBAA Development Commands"
-	@echo "  make install    — Install all dependencies"
-	@echo "  make dev        — Start backend + frontend in dev mode"
-	@echo "  make test       — Run all tests"
-	@echo "  make lint       — Run all linters"
-	@echo "  make clean      — Remove build artifacts and temp files"
+	@echo "  make up          — Start all services (docker compose up)"
+	@echo "  make down        — Stop all services"
+	@echo "  make build       — Rebuild all Docker images"
+	@echo "  make test        — Run all tests (inside containers)"
+	@echo "  make lint        — Run all linters"
+	@echo "  make migrate     — Run Alembic migrations"
+	@echo "  make clean       — Remove containers, volumes, and temp files"
+	@echo "  make secrets-check — Scan for accidentally committed secrets"
 
-install:
-	cd apps/api && pip install -r requirements.txt -r requirements-dev.txt
-	cd apps/web && pnpm install
+up:
+	docker compose up --build -d
+	@echo "Services running:"
+	@echo "  API:    http://localhost:8000"
+	@echo "  Web:    http://localhost:3000"
+	@echo "  ChromaDB: http://localhost:8001"
 
-dev-backend:
-	cd apps/api && source venv/bin/activate && uvicorn src.main:app --reload --port 8000
+down:
+	docker compose down
 
-dev-frontend:
-	cd apps/web && pnpm dev
+build:
+	docker compose build --no-cache
 
 test:
-	cd apps/api && pytest tests/ -v --cov=src --cov-report=term-missing
-	cd apps/web && pnpm test
+	docker compose exec api pytest tests/ -v --cov=src --cov-report=term-missing
+	docker compose exec web pnpm test -- --run
 
 lint:
-	cd apps/api && ruff check . && ruff format --check .
-	cd apps/web && pnpm lint
+	docker compose exec api ruff check . && ruff format --check .
+	docker compose exec web pnpm lint
+
+migrate:
+	docker compose exec api alembic upgrade head
 
 clean:
-	find . -type d -name __pycache__ -exec rm -rf {} +
-	find . -type d -name .pytest_cache -exec rm -rf {} +
-	rm -rf apps/api/uploads/* apps/api/outputs/*
-	cd apps/web && rm -rf dist node_modules/.cache
+	docker compose down -v
+	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
+	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
+
+secrets-check:
+	git secrets --scan
 ```
 
 ---
 
-## 8. CI/CD Pipeline (v1 — Local Only)
-
-Since v1 is deployed locally (no cloud hosting), CI/CD is limited to **pre-commit hooks** and **GitHub Actions** (for automated testing on push).
-
-### 8.1 Pre-Commit Hooks (`.pre-commit-config.yaml`)
+## 8. Pre-Commit Hooks
 
 ```yaml
+# .pre-commit-config.yaml
 repos:
   - repo: https://github.com/charliermarsh/ruff-pre-commit
     rev: v0.1.8
@@ -331,7 +381,6 @@ repos:
     hooks:
       - id: eslint
         files: \.[jt]sx?$
-        types: [file]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.5.0
@@ -342,12 +391,20 @@ repos:
       - id: check-yaml
       - id: no-commit-to-branch
         args: [--branch, main]
+
+  - repo: https://github.com/awslabs/git-secrets
+    rev: 1.3.0
+    hooks:
+      - id: git-secrets           # Blocks commits containing AWS keys, private keys, etc.
 ```
 
-### 8.2 GitHub Actions (`.github/workflows/test.yml`)
+---
+
+## 9. CI/CD Pipeline (GitHub Actions)
 
 ```yaml
-name: Test Suite
+# .github/workflows/test.yml
+name: CI
 
 on:
   push:
@@ -358,90 +415,154 @@ on:
 jobs:
   test-backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: aibaa_test
+          POSTGRES_USER: aibaa
+          POSTGRES_PASSWORD: secret
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
       - name: Install dependencies
-        run: |
-          cd apps/api
-          pip install -r requirements.txt -r requirements-dev.txt
+        run: pip install -r apps/api/requirements.txt -r apps/api/requirements-dev.txt
+      - name: Run migrations
+        run: cd apps/api && alembic upgrade head
+        env:
+          DATABASE_URL: postgresql+asyncpg://aibaa:secret@localhost/aibaa_test
       - name: Lint
-        run: cd apps/api && ruff check .
+        run: ruff check .
       - name: Test
-        run: cd apps/api && pytest tests/ -v --cov=src --cov-fail-under=75
+        run: pytest tests/unit tests/integration -v --cov=src --cov-fail-under=80
+        env:
+          DATABASE_URL: postgresql+asyncpg://aibaa:secret@localhost/aibaa_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET_KEY: test_secret_key_for_ci_only
+          LLM_BACKEND: mock                # Use mock LLM client in CI — no real API calls
+          ANTHROPIC_API_KEY: ""
 
   test-frontend:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm install -g pnpm
+      - run: cd apps/web && pnpm install
+      - run: cd apps/web && pnpm lint
+      - run: cd apps/web && pnpm test -- --run
+
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: trufflesecurity/trufflehog@main
         with:
-          node-version: '20'
-      - name: Install pnpm
-        run: npm install -g pnpm
-      - name: Install dependencies
-        run: cd apps/web && pnpm install
-      - name: Lint
-        run: cd apps/web && pnpm lint
-      - name: Test
-        run: cd apps/web && pnpm test -- --run
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
 ```
 
 ---
 
-## 9. Directory Cleanup Policy
-
-Because v1 stores files locally, a cleanup script prevents disk exhaustion:
+## 10. Data Retention & Cleanup
 
 ```python
 # apps/api/src/utils/cleanup.py
-import os
-import time
+import os, time
 from pathlib import Path
+from sqlalchemy import text
 
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "./uploads"))
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./outputs"))
-MAX_AGE_HOURS = 24  # Clean files older than 24 hours
+RETENTION_DAYS = int(os.getenv("DATA_RETENTION_DAYS", "2555"))  # 7 years default
 
-def cleanup_old_files():
-    """Remove uploaded and output files older than MAX_AGE_HOURS."""
-    now = time.time()
-    cutoff = now - (MAX_AGE_HOURS * 3600)
+async def cleanup_expired_documents(db):
+    """
+    Hard-deletes document files that have exceeded the retention period.
+    Leaves a tombstone record in the database (filename + deletion timestamp).
+    Never deletes MNPI documents without explicit legal hold check.
+    Never deletes audit log entries.
+    """
+    cutoff = time.time() - (RETENTION_DAYS * 86400)
     
-    cleaned = 0
-    for directory in [UPLOAD_DIR, OUTPUT_DIR]:
-        for file_path in directory.rglob("*"):
-            if file_path.is_file() and file_path.stat().st_mtime < cutoff:
-                file_path.unlink()
-                cleaned += 1
+    expired = await db.execute(text("""
+        SELECT id, storage_path, data_classification
+        FROM documents
+        WHERE uploaded_at < :cutoff
+          AND parse_status != 'deleted'
+          AND data_classification != 'mnpi'   -- MNPI requires separate legal review
+    """), {"cutoff": cutoff})
     
-    return cleaned
+    deleted_count = 0
+    for row in expired:
+        path = Path(row.storage_path)
+        if path.exists():
+            # Secure delete: overwrite with zeros before unlinking
+            size = path.stat().st_size
+            with open(path, "wb") as f:
+                f.write(b'\x00' * size)
+            path.unlink()
+        
+        # Mark as deleted in DB (tombstone — never hard-delete the row)
+        await db.execute(text("""
+            UPDATE documents SET parse_status='deleted', parsed_text=NULL
+            WHERE id = :id
+        """), {"id": row.id})
+        deleted_count += 1
+    
+    return deleted_count
 ```
+
+This runs as a nightly ARQ scheduled task, not a fixed 24-hour timer.
 
 ---
 
-## 10. Logging Configuration
+## 11. Logging Configuration
 
 ```python
 # apps/api/src/utils/logging_config.py
-import logging
-import sys
+import structlog, logging, sys, os
 
-def setup_logging(level: str = "INFO"):
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-        ]
+def setup_logging():
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.JSONRenderer()    # Machine-parseable JSON in production
+        ],
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
     )
 
-# Usage: Every agent run logs at INFO level
-# Reasoning steps: DEBUG level
-# Errors: ERROR level with full traceback
+# Usage throughout the codebase:
+import structlog
+logger = structlog.get_logger()
+
+# In every agent run:
+log = logger.bind(run_id=run_id, deal_id=deal_id, agent=agent_type, org_id=org_id)
+log.info("agent_run_started")
+log.info("rag_retrieval_complete", chunk_count=8, query_tokens=24)
+log.info("llm_call_complete", tokens_used=1240, latency_ms=3200)
+log.info("agent_run_complete", confidence=0.87, output_type="xlsx")
+log.error("agent_run_failed", error=str(e), error_type=type(e).__name__)
+
+# Never log: LLM prompts, document content, financial figures, user PII
+# (These may be MNPI or sensitive — Sentry's before_send scrubs them too)
 ```
 
 ---

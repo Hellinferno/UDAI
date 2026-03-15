@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find \"d:/AI Investment Banking Analyst Agent \\(AIBAA\\)\" -type f -name \"*.py\")",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

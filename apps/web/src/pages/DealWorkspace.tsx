@@ -1,18 +1,20 @@
 import { useState, useEffect, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { fetchCurrentUser, fetchDeal, type CurrentUserInfo, type Deal } from '../lib/api'
-import { ArrowLeft, FileText, Bot, Download, LayoutDashboard } from 'lucide-react'
+import { ArrowLeft, FileText, Bot, Download, LayoutDashboard, CheckSquare } from 'lucide-react'
 import DocumentsTab from '../components/workspace/DocumentsTab'
 import AgentsTab from '../components/workspace/AgentsTab'
 import OutputsTab from '../components/workspace/OutputsTab'
+import TasksTab from '../components/workspace/TasksTab'
 
-type TabKey = 'overview' | 'documents' | 'agents' | 'outputs'
+type TabKey = 'overview' | 'documents' | 'agents' | 'outputs' | 'tasks'
 
 const TABS: { key: TabKey; label: string; icon: React.ReactNode }[] = [
     { key: 'overview', label: 'Overview', icon: <LayoutDashboard size={13} /> },
     { key: 'documents', label: 'Data Room', icon: <FileText size={13} /> },
     { key: 'agents', label: 'Agents', icon: <Bot size={13} /> },
     { key: 'outputs', label: 'Outputs', icon: <Download size={13} /> },
+    { key: 'tasks', label: 'Tasks', icon: <CheckSquare size={13} /> },
 ]
 
 export default function DealWorkspace() {
@@ -129,6 +131,7 @@ export default function DealWorkspace() {
                 {activeTab === 'documents' && <DocumentsTab dealId={dealId!} />}
                 {activeTab === 'agents' && <AgentsTab dealId={dealId!} />}
                 {activeTab === 'outputs' && <OutputsTab dealId={dealId!} />}
+                {activeTab === 'tasks' && <TasksTab dealId={dealId!} />}
             </div>
         </div>
     )

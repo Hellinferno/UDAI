@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"../../.venv/Scripts/python.exe\" -m uvicorn src.main:app --port 8003 --host 127.0.0.1)",
+      "Bash(echo \"EXIT: $?\")",
+      "Bash(cat 'd:/AI Investment Banking Analyst Agent \\(AIBAA\\)/apps/api/src/database.py')",
+      "Bash(ls \"d:/AI Investment Banking Analyst Agent \\(AIBAA\\)/apps/data/outputs/\")",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Read(//d/AI Investment Banking Analyst Agent \\(AIBAA\\)/apps/web/**)",
+      "Bash(taskkill //F //IM python.exe)"
+    ]
+  }
+}

@@ -1,19 +1,16 @@
 # 07 — Monorepo Structure
-## AI Investment Banking Analyst Agent (AIBAA)
+## AI Investment Banking Analyst Agent (AIBAA) — v2.0 (Enterprise Edition)
 
 ---
 
 ## 1. Overview
 
-AIBAA uses a **monorepo** structure — all packages (frontend, backend, Colab notebooks, shared utilities) live in a single repository. This simplifies:
-- Cross-package type sharing
-- Unified CI/CD pipeline
-- Consistent tooling and dependency management
-- Easier local development setup
+AIBAA uses a **monorepo** structure. All packages (frontend, backend, agents, tools, shared utilities) live in a single repository.
 
-**Repository Name:** `aibaa`  
-**Package Manager:** `pnpm` (frontend) + `pip` (Python)  
-**Language:** TypeScript (frontend) + Python 3.11 (backend)
+**Repository Name:** `aibaa`
+**Package Manager:** `pnpm` (frontend) + `pip` / `uv` (Python)
+**Language:** TypeScript (frontend) + Python 3.11 (backend/agents)
+**Containerisation:** Docker + docker-compose from day one
 
 ---
 
@@ -22,20 +19,31 @@ AIBAA uses a **monorepo** structure — all packages (frontend, backend, Colab n
 ```
 aibaa/
 │
-├── README.md                          # Project overview and quick-start guide
+├── README.md
 ├── .gitignore
-├── .env.example                       # Template for environment variables
-├── docker-compose.yml                 # Local dev orchestration (optional)
+├── .env.example                          # Template — never commit real values
+├── docker-compose.yml                    # Full local stack: api + worker + web + db + redis + chroma
+├── docker-compose.override.yml          # Developer overrides (hot reload mounts)
+├── Makefile                              # Unified dev commands
 │
 ├── apps/
-│   ├── web/                           # React SPA (Frontend)
-│   └── api/                           # FastAPI Orchestration Backend
+│   ├── web/                              # React SPA (Frontend)
+│   └── api/                              # FastAPI Orchestration Backend
+│
+├── worker/                               # ARQ Worker process (NEW — separate from API)
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── src/
+│       ├── main.py                       # WorkerSettings + startup/shutdown hooks
+│       └── tasks/
+│           └── agent_tasks.py            # run_agent_task(), run_rag_indexing()
 │
 ├── packages/
-│   ├── shared-types/                  # Shared TypeScript/Python type definitions
-│   └── ui-components/                 # Reusable React UI components (design system)
+│   ├── shared-types/                     # Shared TypeScript type definitions
+│   └── ui-components/                    # Reusable React UI components (design system)
 │
-├── agents/                            # All AI agent implementations
+├── agents/                               # All AI agent implementations
+│   ├── base_agent.py
 │   ├── orchestrator/
 │   ├── modeling/
 │   ├── pitchbook/
@@ -44,34 +52,47 @@ aibaa/
 │   ├── doc_drafter/
 │   └── coordination/
 │
-├── tools/                             # Agent tools (callable functions)
+├── tools/                                # Agent tools (callable functions)
 │   ├── file_parser/
 │   ├── excel_writer/
 │   ├── pdf_generator/
+│   ├── pptx_generator/                  # NEW — PPTX output support
 │   ├── doc_generator/
 │   ├── python_executor/
 │   └── web_search/
 │
-├── colab/                             # Google Colab notebooks and inference server
-│   ├── notebooks/
-│   └── inference_server/
+├── rag/                                  # RAG pipeline (NEW)
+│   ├── chunker.py
+│   ├── embedder.py
+│   ├── indexer.py
+│   └── retriever.py
 │
-├── fine_tuning/                       # Unsloth fine-tuning pipeline
-│   ├── datasets/
-│   ├── training/
-│   └── evaluation/
+├── security/                             # Security utilities (NEW)
+│   ├── prompt_guard.py                   # Prompt injection detection + sanitisation
+│   ├── mnpi_checker.py                   # Pre-flight MNPI consent enforcement
+│   └── audit_logger.py                   # Integrity-chained audit log writer
 │
-├── templates/                         # Output document templates
+├── computation/                          # Deterministic financial calculation engine
+│   ├── dcf.py
+│   ├── lbo.py
+│   ├── cca.py
+│   ├── hallucination_guard.py
+│   └── verification.py
+│
+├── templates/                            # Output document templates
 │   ├── excel/
 │   ├── pdf/
+│   ├── pptx/                             # NEW — PPTX templates
 │   └── docx/
 │
-├── tests/                             # Cross-package tests
+├── tests/
+│   ├── unit/
 │   ├── integration/
-│   └── e2e/
+│   ├── llm_eval/
+│   ├── e2e/
+│   └── fixtures/
 │
-└── docs/                              # All PRE-DEV documentation (this folder)
-    ├── 01-product-requirements.md
+└── docs/
     ├── 02-user-stories-and-acceptance-criteria.md
     ├── 03-information-architecture.md
     ├── 04-system-architecture.md
@@ -97,17 +118,17 @@ apps/web/
 ├── vite.config.ts
 ├── tsconfig.json
 ├── tailwind.config.ts
+├── Dockerfile
 ├── index.html
 │
-├── public/
-│   ├── favicon.ico
-│   └── assets/
-│
 └── src/
-    ├── main.tsx                       # App entry point
-    ├── App.tsx                        # Root component + router
+    ├── main.tsx
+    ├── App.tsx
     │
     ├── pages/
+    │   ├── auth/
+    │   │   ├── Login.tsx
+    │   │   └── MFAVerify.tsx
     │   ├── Dashboard.tsx
     │   ├── NewDeal.tsx
     │   ├── DealWorkspace.tsx
@@ -116,6 +137,10 @@ apps/web/
     │   │   ├── AgentsTab.tsx
     │   │   ├── OutputsTab.tsx
     │   │   └── SettingsTab.tsx
+    │   ├── admin/
+    │   │   ├── AuditTrail.tsx
+    │   │   ├── UserManagement.tsx
+    │   │   └── RetentionPolicy.tsx
     │   ├── GlobalSettings.tsx
     │   └── Help.tsx
     │
@@ -124,6 +149,9 @@ apps/web/
     │   │   ├── Sidebar.tsx
     │   │   ├── TopBar.tsx
     │   │   └── Breadcrumb.tsx
+    │   ├── auth/
+    │   │   ├── AuthGuard.tsx             # Redirects unauthenticated users
+    │   │   └── AdminGuard.tsx            # Restricts admin-only routes
     │   ├── deals/
     │   │   ├── DealCard.tsx
     │   │   ├── DealForm.tsx
@@ -132,15 +160,23 @@ apps/web/
     │   │   ├── AgentCard.tsx
     │   │   ├── AgentInputPanel.tsx
     │   │   ├── ReasoningPanel.tsx
-    │   │   └── ProgressStream.tsx
+    │   │   ├── ProgressStream.tsx
+    │   │   └── MNPIConsentBanner.tsx     # NEW — shown when MNPI docs in scope
     │   ├── documents/
     │   │   ├── DocumentUploadZone.tsx
     │   │   ├── DocumentList.tsx
-    │   │   └── DocumentPreview.tsx
+    │   │   ├── DocumentPreview.tsx
+    │   │   ├── MNPIFlagToggle.tsx        # NEW
+    │   │   └── RAGIndexStatus.tsx        # NEW — shows indexing progress
     │   ├── outputs/
     │   │   ├── OutputCard.tsx
     │   │   ├── OutputPreview.tsx
-    │   │   └── ReviewActions.tsx
+    │   │   ├── ReviewActions.tsx
+    │   │   └── ConfidenceBadge.tsx       # NEW — colour-coded confidence score
+    │   ├── charts/                       # NEW — financial semantic colour charts
+    │   │   ├── SensitivityTable.tsx      # Heatmap: green → red
+    │   │   ├── WaterfallChart.tsx
+    │   │   └── RiskBadge.tsx             # High/Medium/Low with semantic colours
     │   ├── tasks/
     │   │   ├── TaskBoard.tsx
     │   │   ├── TaskCard.tsx
@@ -155,31 +191,36 @@ apps/web/
     │       └── ErrorBoundary.tsx
     │
     ├── hooks/
+    │   ├── useAuth.ts                    # JWT management + refresh
     │   ├── useDeals.ts
     │   ├── useAgentRun.ts
-    │   ├── useSSEStream.ts
+    │   ├── useSSEStream.ts               # Handles reconnect + Last-Event-ID
     │   ├── useDocuments.ts
     │   └── useOutputs.ts
     │
     ├── store/
-    │   ├── dealStore.ts               # Zustand store for deals
-    │   ├── agentStore.ts              # Zustand store for agent state
-    │   └── settingsStore.ts           # Zustand store for settings
+    │   ├── authStore.ts                  # NEW — user/token state
+    │   ├── dealStore.ts
+    │   ├── agentStore.ts
+    │   └── settingsStore.ts
     │
     ├── api/
-    │   ├── client.ts                  # Axios instance + interceptors
-    │   ├── deals.ts                   # Deal API functions
-    │   ├── documents.ts               # Document API functions
-    │   ├── agents.ts                  # Agent API functions
-    │   ├── outputs.ts                 # Output API functions
-    │   └── settings.ts                # Settings API functions
+    │   ├── client.ts                     # Axios + JWT interceptor + 401 redirect
+    │   ├── auth.ts
+    │   ├── deals.ts
+    │   ├── documents.ts
+    │   ├── agents.ts
+    │   ├── outputs.ts
+    │   ├── webhooks.ts                   # NEW
+    │   ├── admin.ts                      # NEW
+    │   └── settings.ts
     │
     ├── types/
-    │   └── index.ts                   # TypeScript type definitions
+    │   └── index.ts
     │
     └── styles/
-        ├── globals.css                # CSS reset + base styles
-        └── design-tokens.css          # B&W color tokens
+        ├── globals.css
+        └── design-tokens.css             # B&W chrome + financial semantic palette
 ```
 
 ---
@@ -191,208 +232,150 @@ apps/api/
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── pyproject.toml
-├── Makefile
+├── Dockerfile
+├── alembic.ini
+├── alembic/
+│   ├── env.py
+│   └── versions/
+│       └── 001_initial_schema.py
 │
 └── src/
-    ├── main.py                        # FastAPI app entry point
-    ├── config.py                      # Environment config (Pydantic Settings)
+    ├── main.py                           # FastAPI app, middleware registration
+    ├── config.py                         # Pydantic Settings (reads from env)
+    │
+    ├── auth/
+    │   ├── dependencies.py               # get_current_user, require_admin
+    │   ├── jwt.py                        # create_access_token, verify_token
+    │   └── router.py                     # /auth/* endpoints
+    │
+    ├── middleware/
+    │   ├── idempotency.py                # Redis-backed request deduplication
+    │   ├── rate_limiting.py              # slowapi token bucket
+    │   └── security_headers.py          # HSTS, CSP, X-Frame-Options
     │
     ├── routers/
-    │   ├── __init__.py
     │   ├── deals.py
     │   ├── documents.py
     │   ├── agents.py
     │   ├── outputs.py
     │   ├── tasks.py
+    │   ├── webhooks.py                   # NEW
+    │   ├── admin.py                      # NEW
     │   └── settings.py
     │
     ├── models/
-    │   ├── __init__.py
-    │   ├── deal.py                    # Pydantic models for Deal
+    │   ├── deal.py
     │   ├── document.py
     │   ├── agent_run.py
     │   ├── output.py
     │   ├── task.py
+    │   ├── audit_log.py
+    │   ├── webhook.py                    # NEW
     │   └── settings.py
     │
     ├── services/
-    │   ├── __init__.py
     │   ├── deal_service.py
     │   ├── document_service.py
-    │   ├── agent_service.py           # Orchestrates agent execution
+    │   ├── agent_service.py              # Enqueues ARQ jobs
     │   ├── output_service.py
-    │   └── task_service.py
+    │   ├── task_service.py
+    │   ├── webhook_service.py            # NEW — HMAC delivery
+    │   └── audit_service.py             # NEW — append-only logger
     │
-    ├── store/
-    │   ├── __init__.py
-    │   └── memory_store.py            # In-memory data store (v1)
+    ├── database.py                       # SQLAlchemy engine + get_db()
+    ├── redis.py                          # Redis client + get_redis()
     │
     ├── llm/
-    │   ├── __init__.py
-    │   ├── client.py                  # HTTP client to Colab inference server
-    │   └── prompt_builder.py          # Prompt construction per agent type
+    │   ├── base_client.py                # BaseLLMClient ABC
+    │   ├── anthropic_client.py           # AnthropicClient (default)
+    │   ├── openai_client.py              # OpenAIClient (optional)
+    │   ├── colab_client.py               # ColabClient (fine-tune testing only)
+    │   ├── factory.py                    # get_llm_client() — reads LLM_BACKEND env
+    │   └── prompt_builder.py             # System prompts per agent type
     │
     └── utils/
-        ├── __init__.py
         ├── file_utils.py
         ├── error_handlers.py
-        └── logging_config.py
+        └── logging_config.py             # structlog JSON formatter
 ```
 
 ---
 
-### `agents/` — Agent Implementations
+### `worker/` — ARQ Task Worker *(NEW — separate process)*
 
 ```
-agents/
-├── base_agent.py                      # Abstract base class for all agents
+worker/
+├── Dockerfile
+├── requirements.txt
 │
-├── orchestrator/
-│   ├── __init__.py
-│   ├── agent.py                       # OrchestratorAgent class
-│   └── routing_rules.py              # Task routing logic
-│
-├── modeling/
-│   ├── __init__.py
-│   ├── agent.py                       # FinancialModelingAgent class
-│   ├── dcf.py                         # DCF model logic
-│   ├── lbo.py                         # LBO model logic
-│   └── comparable_analysis.py         # CCA logic
-│
-├── pitchbook/
-│   ├── __init__.py
-│   ├── agent.py                       # PitchbookAgent class
-│   ├── slide_builder.py              # Individual slide construction
-│   └── pdf_composer.py               # Assembles slides into final PDF
-│
-├── due_diligence/
-│   ├── __init__.py
-│   ├── agent.py                       # DueDiligenceAgent class
-│   ├── document_classifier.py
-│   ├── risk_extractor.py
-│   └── checklist_populator.py
-│
-├── research/
-│   ├── __init__.py
-│   ├── agent.py                       # ResearchAgent class
-│   ├── industry_analyzer.py
-│   └── buyer_universe_builder.py
-│
-├── doc_drafter/
-│   ├── __init__.py
-│   ├── agent.py                       # DocDrafterAgent class
-│   ├── cim_sections.py
-│   └── narrative_generator.py
-│
-└── coordination/
-    ├── __init__.py
-    ├── agent.py                       # CoordinationAgent class
-    ├── note_processor.py
-    └── task_extractor.py
+└── src/
+    ├── main.py                           # WorkerSettings, startup, shutdown
+    └── tasks/
+        ├── agent_tasks.py                # run_agent_task()
+        └── indexing_tasks.py             # run_rag_indexing()
+```
+
+The worker runs in its own Docker container. It shares the same codebase as the API (mounted as a volume) but runs the ARQ worker entrypoint instead of uvicorn. This means agent tasks survive API server restarts — they are persisted in Redis and picked up by any available worker.
+
+---
+
+### `rag/` — RAG Pipeline *(NEW)*
+
+```
+rag/
+├── __init__.py
+├── chunker.py                            # Semantic-aware chunking (512 tokens, 64 overlap)
+├── embedder.py                           # sentence-transformers: BAAI/bge-base-en-v1.5
+├── indexer.py                            # ChromaDB collection management
+└── retriever.py                          # retrieve_context(deal_id, query, top_k)
 ```
 
 ---
 
-### `tools/` — Agent Tools
+### `security/` — Security Utilities *(NEW)*
 
 ```
-tools/
-├── base_tool.py                       # Abstract Tool base class
-│
-├── file_parser/
-│   ├── __init__.py
-│   ├── pdf_parser.py                  # PyMuPDF-based PDF text extraction
-│   ├── excel_parser.py                # openpyxl-based XLSX parsing
-│   ├── word_parser.py                 # python-docx based DOCX parsing
-│   └── csv_parser.py
-│
-├── excel_writer/
-│   ├── __init__.py
-│   ├── workbook_builder.py            # Creates XLSX from structured data
-│   └── chart_builder.py              # Adds charts to Excel files
-│
-├── pdf_generator/
-│   ├── __init__.py
-│   ├── report_builder.py              # ReportLab-based PDF generation
-│   └── template_renderer.py          # Applies B&W design templates
-│
-├── doc_generator/
-│   ├── __init__.py
-│   └── word_builder.py               # python-docx based DOCX generation
-│
-├── python_executor/
-│   ├── __init__.py
-│   └── safe_executor.py               # Sandboxed Python code execution
-│
-└── web_search/
-    ├── __init__.py
-    └── search_client.py               # Stub web search (v2: real API)
+security/
+├── __init__.py
+├── prompt_guard.py                       # Injection detection + content delimiting
+├── mnpi_checker.py                       # Pre-flight MNPI consent enforcement
+└── audit_logger.py                       # log_event() with SHA-256 integrity chaining
 ```
 
 ---
 
-### `colab/` — Colab Integration
+### `computation/` — Financial Calculation Engine
 
 ```
-colab/
-├── notebooks/
-│   ├── 01_environment_setup.ipynb     # Install Unsloth + dependencies
-│   ├── 02_load_model.ipynb            # Load base model + LoRA adapters
-│   ├── 03_start_inference_server.ipynb # Start FastAPI + ngrok tunnel
-│   └── 04_fine_tuning_guide.ipynb    # Step-by-step fine-tuning notebook
-│
-└── inference_server/
-    ├── requirements.txt
-    ├── server.py                      # FastAPI inference server (runs in Colab)
-    └── model_loader.py               # Unsloth model loading utilities
+computation/
+├── __init__.py
+├── dcf.py                                # DCFEngine — mid-year discounting, Hamada beta, _frange
+├── lbo.py                                # LBOEngine — numpy_financial IRR, full cash flow series
+├── cca.py                                # CCAEngine — multiples, percentile benchmarks
+├── hallucination_guard.py                # Typed field registry: DOCUMENT_EXTRACTED vs COMPUTED
+└── verification.py                       # Output verification checklist (TV%, DSCR, IRR sanity)
 ```
 
 ---
 
-### `fine_tuning/` — Unsloth Fine-Tuning Pipeline
+## 4. Docker Compose Architecture
 
+```yaml
+# docker-compose.yml (see 11-environment-and-devops.md for full spec)
+services:
+  api:       FastAPI — port 8000
+  worker:    ARQ worker — consumes jobs from Redis
+  web:       React Vite dev server — port 3000
+  db:        PostgreSQL 16 — port 5432
+  redis:     Redis 7 — port 6379
+  chroma:    ChromaDB — port 8001
 ```
-fine_tuning/
-├── datasets/
-│   ├── raw/                           # Raw IB training data (CSV/JSONL)
-│   ├── processed/                     # Cleaned, formatted datasets
-│   └── README.md                      # Dataset documentation
-│
-├── training/
-│   ├── config.yaml                    # Training hyperparameters
-│   ├── train.py                       # Unsloth LoRA training script
-│   └── prompt_templates.py           # Instruction-tuning prompt formats
-│
-└── evaluation/
-    ├── eval.py                        # Model evaluation script
-    ├── benchmarks/                    # IB-specific benchmark tasks
-    └── results/                       # Evaluation results (gitignored)
-```
+
+`docker compose up` gives any developer the entire stack. No manual Python environment setup. No "works on my machine."
 
 ---
 
-### `templates/` — Document Templates
-
-```
-templates/
-├── excel/
-│   ├── dcf_template.xlsx             # DCF model skeleton with formatting
-│   ├── lbo_template.xlsx             # LBO model skeleton
-│   └── cca_template.xlsx             # Comparable company analysis skeleton
-│
-├── pdf/
-│   ├── pitchbook_template.py         # ReportLab template: B&W pitchbook
-│   ├── dd_report_template.py         # ReportLab template: DD risk report
-│   └── research_brief_template.py    # ReportLab template: research brief
-│
-└── docx/
-    ├── cim_template.docx             # CIM skeleton with styles
-    └── executive_summary_template.docx
-```
-
----
-
-## 4. Package Dependencies
+## 5. Package Dependencies
 
 ### Frontend (`apps/web/package.json`)
 ```json
@@ -413,7 +396,8 @@ templates/
     "tailwindcss": "^3.3.0",
     "@types/react": "^18.2.0",
     "vitest": "^1.0.0",
-    "@testing-library/react": "^14.0.0"
+    "@testing-library/react": "^14.0.0",
+    "@playwright/test": "^1.40.0"
   }
 }
 ```
@@ -424,31 +408,50 @@ fastapi==0.104.0
 uvicorn[standard]==0.24.0
 pydantic==2.5.0
 pydantic-settings==2.1.0
+sqlalchemy[asyncio]==2.0.23
+aiosqlite==0.19.0              # SQLite async driver (dev)
+asyncpg==0.29.0                # PostgreSQL async driver (prod)
+alembic==1.12.0
 httpx==0.25.0
 python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+slowapi==0.1.9
+arq==0.25.0
+redis[asyncio]==5.0.0
+anthropic==0.16.0
+openai==1.6.0
 PyMuPDF==1.23.0
 python-docx==1.1.0
+python-pptx==0.6.23
 openpyxl==3.1.2
 reportlab==4.0.7
 pandas==2.1.0
 numpy==1.26.0
+numpy-financial==1.0.0
+sentence-transformers==2.2.2
+chromadb==0.4.18
+structlog==23.2.0
+sentry-sdk[fastapi]==1.38.0
 aiofiles==23.2.1
+pyotp==2.9.0
 ```
 
-### Colab Inference Server (`colab/inference_server/requirements.txt`)
+### Worker (`worker/requirements.txt`)
 ```
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
-fastapi==0.104.0
-uvicorn==0.24.0
-pyngrok==7.0.0
-transformers==4.36.0
-torch==2.1.0
-bitsandbytes==0.41.0
+arq==0.25.0
+redis[asyncio]==5.0.0
+anthropic==0.16.0
+openai==1.6.0
+numpy-financial==1.0.0
+sentence-transformers==2.2.2
+chromadb==0.4.18
+# (shares computation/, rag/, agents/, tools/, security/ from monorepo root)
 ```
 
 ---
 
-## 5. Naming Conventions
+## 6. Naming Conventions
 
 | Artifact | Convention | Example |
 |---|---|---|
@@ -456,12 +459,12 @@ bitsandbytes==0.41.0
 | Python classes | `PascalCase` | `FinancialModelingAgent` |
 | Python functions | `snake_case` | `build_dcf_model()` |
 | TypeScript files | `PascalCase.tsx` / `camelCase.ts` | `AgentCard.tsx`, `useAgentRun.ts` |
-| TypeScript components | `PascalCase` | `AgentCard` |
 | CSS class names | `kebab-case` | `agent-card__reasoning-panel` |
 | API routes | `kebab-case` | `/agent-runs/:id` |
-| Environment variables | `SCREAMING_SNAKE_CASE` | `LLM_ENDPOINT_URL` |
-| Git branches | `type/description` | `feat/dcf-model-agent` |
-| Commit messages | Conventional Commits | `feat: add DCF model output formatter` |
+| Environment variables | `SCREAMING_SNAKE_CASE` | `LLM_BACKEND` |
+| Git branches | `type/description` | `feat/rag-pipeline` |
+| Commit messages | Conventional Commits | `feat: add RAG retrieval to modeling agent` |
+| Docker images | `aibaa-{service}` | `aibaa-api`, `aibaa-worker`, `aibaa-web` |
 
 ---
 

@@ -1,4 +1,5 @@
 import logging
+import os
 import uuid
 from typing import Any, Dict
 
@@ -89,6 +90,57 @@ class BaseAgent:
         self.run_record.error_message = error_message
         self._log_step("error", error_message)
         self._sync_to_db()
+
+    def _extract_document_context(self) -> str:
+        """Returns last 400K chars of all parsed documents for this deal."""
+        from store import store
+        MAX_CHARS = 400_000
+        docs = [d for d in store.documents.values()
+                if d.deal_id == self.deal_id and d.parse_status == "parsed"]
+        combined = "\n\n---\n\n".join(d.parsed_text or "" for d in docs)
+        return combined[-MAX_CHARS:] if len(combined) > MAX_CHARS else combined
+
+    def _get_deal_info(self) -> dict:
+        """Returns dict with company_name, deal_type, industry, deal_name."""
+        from store import store
+        deal = store.deals.get(self.deal_id)
+        if not deal:
+            return {}
+        return {
+            "company_name": getattr(deal, "company_name", ""),
+            "deal_type": getattr(deal, "deal_type", ""),
+            "industry": getattr(deal, "industry", ""),
+            "deal_name": getattr(deal, "name", ""),
+        }
+
+    def _register_output(self, file_path: str, output_type: str, output_category: str) -> None:
+        """Adds output to store so persist_run_bundle() picks it up."""
+        from store import store, Output
+        output = Output(
+            id=str(uuid.uuid4()),
+            deal_id=self.deal_id,
+            agent_run_id=self.run_id,
+            filename=os.path.basename(file_path),
+            storage_path=file_path,
+            output_type=output_type,
+            output_category=output_category,
+            review_status="draft",
+        )
+        store.outputs[output.id] = output
+
+    def _get_latest_dcf_output(self) -> dict:
+        """Returns valuation_result from the most recent completed DCF run for this deal."""
+        from store import store
+        dcf_runs = [
+            r for r in store.agent_runs.values()
+            if r.deal_id == self.deal_id
+            and r.agent_type == "modeling"
+            and r.status == "completed"
+        ]
+        if not dcf_runs:
+            return {}
+        latest = max(dcf_runs, key=lambda r: getattr(r, "created_at", "") or "")
+        return (latest.input_payload or {}).get("valuation_result", {})
 
     def run(self):
         """Abstract method to be overridden by subclasses."""
